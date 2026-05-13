@@ -7,7 +7,7 @@
 
 ## Why midimi?
 
-This is a personal project to help me learn music theory. I've been using LLMs (chat interfaces like ChatGPT) to learn music theory and find the lack of inline note/chord playback very limiting. So I conjured up midimi, a LLM driven music theory chatbot that will explain music theory concepts *and* play the examples live through my speakers with reasonable quality and accuracy (though the model you chose impacts accuracy). Midime can also direct output to Garagband or Ableton for example, but I haven't played with that much as the core use case is just simple playback to match theory to sound.
+This is a personal project to help me learn music theory. I've been using LLMs (chat interfaces like ChatGPT) to learn music theory and find the lack of inline note/chord playback very limiting. So I conjured up midimi, a LLM driven music theory chatbot that will explain music theory concepts *and* play the examples live through my speakers with reasonable quality and accuracy (though the model you chose impacts accuracy). Midime can also direct output to Garageband or Ableton for example, but I haven't played with that much as the core use case is just simple playback to match theory to sound.
 
 Ask: *"explain the difference between major and minor chords"*
 
