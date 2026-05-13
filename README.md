@@ -1,0 +1,83 @@
+# midimi
+
+> **Local use only.** midimi is designed to run on your own machine and has no authentication, rate limiting, or access controls. Do not expose it on a public network or shared host.
+
+> **Vibe coded.** This was a quick one-off to unblock my music theory learning journey. Midimi is not meant to be a stellar example of my engineering prowess (as can be seen by the nearly 2kloc server.py implementation).
+
+
+## Why midimi?
+
+This is a personal project to help me learn music theory. I've been using LLMs (chat interfaces like ChatGPT) to learn music theory and find the lack of inline note/chord playback very limiting. So I conjured up midimi, a LLM driven music theory chatbot that will explain music theory concepts *and* play the examples live through my speakers with reasonable quality and accuracy (though the model you chose impacts accuracy). Midime can also direct output to Garagband or Ableton for example, but I haven't played with that much as the core use case is just simple playback to match theory to sound.
+
+Ask: *"explain the difference between major and minor chords"*
+
+Midimi (using a supplied Claude API key) explains the theory, then makes the chords available for immediate playback through your speakers — a **C major** pill and a **C minor** pill appear in the chat, each clickable to play. You can unfold the pill to see how the notes/chords/sequences appear on a staff. Historical conversations are presented on the left like all chat style interfaces, and they can be individually 'starred'.
+
+![midimi chat interface](midimi.png)
+
+ 
+
+## Requirements
+
+- macOS (uses CoreAudio)
+- Python 3.11+
+- [Homebrew](https://brew.sh)
+- An [Anthropic API key](https://console.anthropic.com/)
+
+## Setup
+
+### 1. Install FluidSynth
+
+```bash
+brew install fluid-synth
+```
+
+### 2. Get a soundfont
+
+FluidSynth needs a General MIDI soundfont (`.sf2`) to produce sound. GeneralUser GS is free and works well (I found the latest here: https://www.schristiancollins.com/generaluser). Place it at `~/Music/GeneralUser-GS.sf2`. If you save it elsewhere, set `SOUNDFONT` when you run the server (see [Configuration](#configuration) below).
+
+Verify FluidSynth can use it:
+
+```bash
+fluidsynth -a coreaudio ~/Music/GeneralUser-GS.sf2
+# at the > prompt, type: noteon 0 60 100
+# you should hear a piano note. type: quit
+```
+
+### 3. Install Python dependencies
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install anthropic fastapi mido pyfluidsynth uvicorn
+```
+
+### 4. Run
+
+```bash
+.venv/bin/uvicorn server:app
+```
+
+Then open **http://localhost:8000** in your browser. Enter your Anthropic API key in the Settings modal (⚙) the first time you run it.
+
+## Configuration
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `SOUNDFONT` | `~/Music/GeneralUser-GS.sf2` | Path to your `.sf2` soundfont file. Defaults to that location if unset. |
+
+If your soundfont is in a different location:
+
+```bash
+SOUNDFONT=/path/to/your.sf2 .venv/bin/uvicorn server:app
+```
+
+## Usage tips
+
+- Ask about any music theory concept — chord types, scales, intervals, progressions, modes
+- Click ▶ on any pill to play a chord or sequence; click the note chips to hear individual notes
+- Click 𝄞 to see the chord or sequence rendered on a staff
+- Try prompts like:
+  - *"Walk me through the circle of fifths"*
+  - *"What makes a dominant 7th chord tense?"*
+  - *"Show me a ii-V-I progression in C major"*
+  - *"What's the difference between Dorian and Aeolian mode?"*
