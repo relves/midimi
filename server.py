@@ -15,6 +15,7 @@ from pathlib import Path
 import anthropic
 import fluidsynth
 import mido
+from sequencer.abc import parse_abc, to_abc, ABCParseError, per_bar_report
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
@@ -247,12 +248,47 @@ ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 
 SYSTEM_PROMPT = """You are an expert music theory teacher. You explain concepts clearly, use examples, and make learning engaging.
 
-When discussing chords, scales, or any musical material that would benefit from being heard, use the playback tools liberally.
-- Use play_notes for one isolated chord, interval, or note.
-- Use play_sequence for progressions, cadences, grooves, arpeggios, or examples where timing matters. Prefer play_sequence over several play_notes calls when the musical relationship depends on rhythm or order.
-- Use play_melody for single-line melodies. Give explicit pitches like C4, F#4, Bb3 and named durations like quarter, half, dotted_quarter, or eighth.
-- Use validate_sequence before playing when the exact order, octave, meter, or rhythm matters. Read its normalized notes and warnings, then correct your input if needed.
-- If the user includes an image of sheet music, first transcribe what you can see, then play it back with play_melody for a single staff line or play_sequence for chords/polyphony. Make reasonable tempo, meter, octave, and duration assumptions when the image is incomplete, and say what you assumed.
+## Playback tools
+
+- Use **play_notes** for one isolated chord, interval, or single note.
+- Use **play_abc** for any melody, progression, or rhythmic example longer than a single chord. This is the primary tool for sequences — it accepts ABC notation and gives you per-bar feedback.
+- Use **check_abc** to validate ABC before playing when correctness is critical (e.g. anything more than a couple of bars, or when meter or rhythm matters). Read the normalized ABC and per-bar report in the result, fix any errors, then call play_abc.
+- If the user includes an image of sheet music, transcribe it to ABC notation, run check_abc, then play_abc.
+
+## ABC notation guide
+
+ABC is a text format for music. Key headers: `X:1`, `T:title`, `M:4/4`, `L:1/4`, `Q:120`, `K:C`.
+
+**Notes**: Uppercase letters = octave 3 (C=C3, middle C is `c` lowercase). Lowercase = octave 4. `'` raises an octave, `,` lowers. Examples: `C`=C3, `c`=C4, `c'`=C5, `C,`=C2.
+
+**Duration** (with `L:1/4` — recommended): bare note = quarter, `2` = half, `4` = whole, `/2` = eighth, `3/2` = dotted quarter.
+
+**Accidentals**: `^` = sharp, `_` = flat, `=` = natural. Accidentals persist within a bar; key signature applies to bare notes.
+
+**Rests**: `z` (same duration syntax as notes).
+
+**Chords**: `[ceg]` sounds C E G simultaneously. Duration multiplier after `]`.
+
+**Barlines**: `|` separates bars. The server counts beats per bar and reports errors with bar numbers. Always fill bars completely — the meter is enforced.
+
+**Example** — first 4 bars of a scale in C major, 4/4, 120 bpm:
+```
+X:1
+T:C Major Scale
+M:4/4
+L:1/4
+Q:120
+K:C
+c d e f | g a b c' | c' b a g | f e d c |
+```
+
+**Workflow for anything more than 2 bars:**
+1. Write the ABC.
+2. Call check_abc to get the per-bar report and normalized ABC.
+3. If there are errors, fix them and re-check.
+4. When clean, call play_abc with the normalized ABC from step 2.
+
+## play_notes guide
 
 For the play_notes tool, specify:
 - root: note name like "C", "F#", "Bb", "Db" (never use raw MIDI numbers)
@@ -265,13 +301,41 @@ For the play_notes tool, specify:
 - duration_ms: 800–2000ms is typical for chords
 - label: a short human-readable name like "C major" or "G7"
 
-**Interval demonstrations**: When showing multiple intervals from a root (e.g. "C to each interval"), use the two-note dyad qualities (m2, M2, m3, M3, P4, A4, P5, m6, M6, m7, M7) so both notes sound together. Play each dyad with play_notes, OR use play_sequence with one event per dyad (root=C, quality=M3 gives C+E simultaneously). Never play a sequence of bare single notes and describe it as interval pairs — the user must actually hear both notes together to understand the interval.
+**Interval demonstrations**: When showing multiple intervals from a root, use dyad qualities (m2, M2, m3, M3, P4, A4, P5, m6, M6, m7, M7) so both notes sound together. Never play single notes and describe them as interval pairs — the user must hear both notes simultaneously.
 
-**Accuracy rule**: Your text description must exactly match the events in your tool call. If you play 8 events, describe all 8. Never cherry-pick a subset of played notes to describe, and never describe notes you didn't play.
+**Accuracy rule**: Your text description must exactly match the events in your tool call. Never describe notes you didn't play.
 
 Always explain what you're playing so the user learns to connect sound to theory."""
 
 TOOLS = [
+    {
+        "name": "check_abc",
+        "description": "Parse and validate ABC notation without playing. Returns normalized ABC, per-bar beat-accounting report, and any errors. Use this before play_abc for anything more than a couple of bars.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "abc": {
+                    "type": "string",
+                    "description": "Full ABC notation string including headers (X:, T:, M:, L:, Q:, K:) and body.",
+                },
+            },
+            "required": ["abc"],
+        },
+    },
+    {
+        "name": "play_abc",
+        "description": "Parse ABC notation, save it, and play it back. Returns normalized ABC and a per-bar report so you can verify what was actually stored. Use check_abc first for complex pieces.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "abc": {
+                    "type": "string",
+                    "description": "Full ABC notation string including headers (X:, T:, M:, L:, Q:, K:) and body.",
+                },
+            },
+            "required": ["abc"],
+        },
+    },
     {
         "name": "play_notes",
         "description": "Play a chord, interval, or single note. The server computes the exact MIDI notes from root + quality + octave — never guess MIDI numbers yourself.",
@@ -1603,7 +1667,91 @@ def chat_stream(req: ChatRequest):
             # Execute tools and emit pills inline
             tool_results = []
             for tool in pending_tools:
-                if tool["name"] == "play_notes":
+                if tool["name"] == "check_abc":
+                    inp = tool["input"]
+                    try:
+                        sequence = parse_abc(inp["abc"])
+                    except ABCParseError as e:
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool["id"],
+                            "content": f"ABC parse error:\n{e}",
+                            "is_error": True,
+                        })
+                        continue
+                    normalized = to_abc(sequence)
+                    bar_msgs = per_bar_report(sequence)
+                    report_lines = [
+                        f"Title: {sequence['title']}",
+                        f"Tempo: {sequence['tempo_bpm']} bpm",
+                        f"Meter: {sequence['time_signature']}",
+                        f"Key: {sequence.get('key', 'C')}",
+                        f"Total: {sequence['total_beats']:.4g} beats ({sequence['duration_ms']}ms)",
+                        "",
+                        "Per-bar report:",
+                    ]
+                    report_lines += (bar_msgs if bar_msgs else ["  All bars correct."])
+                    report_lines += ["", "Normalized ABC:", normalized]
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool["id"],
+                        "content": "\n".join(report_lines),
+                    })
+                    continue
+
+                elif tool["name"] == "play_abc":
+                    inp = tool["input"]
+                    try:
+                        sequence = parse_abc(inp["abc"])
+                    except ABCParseError as e:
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool["id"],
+                            "content": f"ABC parse error:\n{e}",
+                            "is_error": True,
+                        })
+                        continue
+
+                    sequence_id = str(uuid.uuid4())[:8]
+                    midi_path = write_sequence_midi(sequence, sequence_id)
+                    _sequence_registry[sequence_id] = {"sequence": sequence, "midi_path": midi_path}
+                    play_sequence_in_background(sequence_id)
+
+                    pill_id = f"p{str(uuid.uuid4())[:6]}"
+                    midi_url = f"/sequence/{sequence_id}/download"
+                    yield ds_merge_fragment(
+                        sequence_pill(sequence_id, sequence["title"], pill_id, sequence["duration_ms"], midi_url, sequence["events"]),
+                        selector=f"#{asst_msg_id} .bubble",
+                    )
+
+                    assistant_record.append({
+                        "type": "sequence",
+                        "sequence_id": sequence_id,
+                        "title": sequence["title"],
+                        "duration_ms": sequence["duration_ms"],
+                        "sequence": sequence,
+                        "midi_path": str(midi_path),
+                    })
+
+                    normalized = to_abc(sequence)
+                    bar_msgs = per_bar_report(sequence)
+                    report_lines = [
+                        f"Played: {sequence['title']}",
+                        f"Tempo: {sequence['tempo_bpm']} bpm  Meter: {sequence['time_signature']}  Key: {sequence.get('key', 'C')}",
+                        f"Total: {sequence['total_beats']:.4g} beats ({sequence['duration_ms']}ms)",
+                        "",
+                        "Per-bar report:",
+                    ]
+                    report_lines += (bar_msgs if bar_msgs else ["  All bars correct."])
+                    report_lines += ["", "Normalized ABC (what was stored):", normalized]
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool["id"],
+                        "content": "\n".join(report_lines),
+                    })
+                    continue
+
+                elif tool["name"] == "play_notes":
                     inp = tool["input"]
                     duration_ms = inp.get("duration_ms", DEFAULT_DURATION_MS)
                     label = inp.get("label", "")
