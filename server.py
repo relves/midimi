@@ -16,99 +16,17 @@ import anthropic
 import fluidsynth
 import mido
 from sequencer.abc import parse_abc, to_abc, ABCParseError, per_bar_report
+from sequencer.theory import (
+    normalize_chord_quality, chord_note_names, build_chord, parse_pitch,
+    NOTE_NAMES, CHORD_INTERVALS,
+)
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-# ── Music theory helpers ──────────────────────────────────────────────────────
 
-NOTE_NAMES = {
-    "C": 0, "B#": 0,
-    "C#": 1, "Db": 1,
-    "D": 2,
-    "D#": 3, "Eb": 3,
-    "E": 4, "Fb": 4,
-    "F": 5, "E#": 5,
-    "F#": 6, "Gb": 6,
-    "G": 7,
-    "G#": 8, "Ab": 8,
-    "A": 9,
-    "A#": 10, "Bb": 10,
-    "B": 11, "Cb": 11,
-}
-
-CHORD_INTERVALS = {
-    "note":        [0],
-    "octave":      [0, 12],
-    # Two-note intervals (root + one interval note, played simultaneously)
-    "m2":          [0, 1],   # minor 2nd / half step
-    "M2":          [0, 2],   # major 2nd / whole step
-    "m3":          [0, 3],   # minor 3rd
-    "M3":          [0, 4],   # major 3rd
-    "P4":          [0, 5],   # perfect 4th
-    "A4":          [0, 6],   # augmented 4th / tritone
-    "P5":          [0, 7],   # perfect 5th
-    "m6":          [0, 8],   # minor 6th
-    "M6":          [0, 9],   # major 6th
-    "m7":          [0, 10],  # minor 7th interval dyad
-    "M7":          [0, 11],  # major 7th interval dyad
-    "major":       [0, 4, 7],
-    "minor":       [0, 3, 7],
-    "diminished":  [0, 3, 6],
-    "augmented":   [0, 4, 8],
-    "sus2":        [0, 2, 7],
-    "sus4":        [0, 5, 7],
-    "major7":      [0, 4, 7, 11],
-    "dominant7":   [0, 4, 7, 10],
-    "minor7":      [0, 3, 7, 10],
-    "minormajor7": [0, 3, 7, 11],
-    "halfdiminished7": [0, 3, 6, 10],
-    "diminished7": [0, 3, 6, 9],
-    "augmented7":  [0, 4, 8, 10],
-    "major9":      [0, 4, 7, 11, 14],
-    "dominant9":   [0, 4, 7, 10, 14],
-    "dominant7b9": [0, 4, 7, 10, 13],
-    "minor9":      [0, 3, 7, 10, 14],
-    "add9":        [0, 4, 7, 14],
-    "major6":      [0, 4, 7, 9],
-    "minor6":      [0, 3, 7, 9],
-    "dominant11":  [0, 4, 7, 10, 14, 17],
-    "dominant13":  [0, 4, 7, 10, 14, 17, 21],
-}
-
-
-_SHARP_NAMES = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"]
-_FLAT_NAMES  = ["C", "D♭", "D", "E♭", "E", "F", "G♭", "G", "A♭", "A", "B♭", "B"]
-
-# Roots that conventionally use flat spelling
-_FLAT_ROOTS = {"F", "Bb", "Eb", "Ab", "Db", "Gb", "Cb", "Fb"}
-_PITCH_RE = re.compile(r"^([A-Ga-g])([#b♯♭]?)(-?\d+)$")
-_QUALITY_ALIASES = {
-    "7": "dominant7",
-    "dom7": "dominant7",
-    "dominant": "dominant7",
-    "9": "dominant9",
-    "dom9": "dominant9",
-    "7b9": "dominant7b9",
-    "7flat9": "dominant7b9",
-    "dom7b9": "dominant7b9",
-    "dom7flat9": "dominant7b9",
-    "dominant7flat9": "dominant7b9",
-    # interval dyad aliases
-    "minor2": "m2", "halfstep": "m2", "half": "m2",
-    "major2": "M2", "wholestep": "M2", "whole": "M2",
-    "minor3": "m3",
-    "major3": "M3",
-    "perfect4": "P4", "perf4": "P4",
-    "tritone": "A4", "aug4": "A4", "dim5": "A4",
-    "perfect5": "P5", "perf5": "P5",
-    "minor6": "m6",
-    "major6dyad": "M6",
-    "minor7dyad": "m7",
-    "major7dyad": "M7",
-}
 _DURATION_BEATS = {
     "whole": 4.0,
     "half": 2.0,
@@ -118,120 +36,13 @@ _DURATION_BEATS = {
     "thirty_second": 0.125,
 }
 
+_SHARP_NAMES = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"]
+_FLAT_NAMES  = ["C", "D♭", "D", "E♭", "E", "F", "G♭", "G", "A♭", "A", "B♭", "B"]
+
 
 def midi_note_name(n: int, prefer_flats: bool = False) -> str:
     names = _FLAT_NAMES if prefer_flats else _SHARP_NAMES
     return f"{names[n % 12]}{n // 12 - 1}"
-
-
-def parse_pitch(value: str) -> tuple[str, int, int]:
-    """Parse a note name like C4, F#3, or Bb5 into root, octave, and MIDI note."""
-    match = _PITCH_RE.match(str(value).strip())
-    if not match:
-        raise ValueError(f"Unknown pitch: {value!r}. Use names like C4, F#3, or Bb5.")
-
-    letter, accidental, octave_s = match.groups()
-    accidental = accidental.replace("♯", "#").replace("♭", "b")
-    root = letter.upper() + accidental
-    octave = int(octave_s)
-    return root, octave, build_chord(root, "note", octave)[0]
-
-
-def normalize_chord_quality(quality: str, root: str | None = None) -> str:
-    """Normalize common chord shorthand to the server's canonical qualities."""
-    raw = str(quality or "").strip()
-    if raw in CHORD_INTERVALS:
-        return raw
-
-    normalized = (
-        raw.lower()
-        .replace("♭", "b")
-        .replace("♯", "#")
-        .replace(" ", "")
-        .replace("-", "")
-        .replace("_", "")
-    )
-    if root:
-        normalized_root = root.lower().replace("♭", "b").replace("♯", "#")
-        if normalized.startswith(normalized_root):
-            normalized = normalized[len(normalized_root):]
-
-    return _QUALITY_ALIASES.get(normalized, normalized)
-
-
-def prefer_flats_for(root: str, quality: str = "") -> bool:
-    normalized_quality = str(quality or "").lower().replace("♭", "b")
-    return root in _FLAT_ROOTS or "b9" in normalized_quality or "flat9" in normalized_quality
-
-
-_LETTERS = "CDEFGAB"
-_LETTER_PC = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
-# diatonic steps each interval represents (disambiguates enharmonic spellings)
-_INTERVAL_DIATONIC = {
-    0: 0, 1: 1, 2: 1, 3: 2, 4: 2, 5: 3,
-    6: 4,   # dim5 (b5)
-    7: 4, 8: 4,   # P5 / aug5 (#5)
-    9: 5,   # maj6 (or enharmonic dim7 — spelled as 6th for readability)
-    10: 6,  # min7 (b7)
-    11: 6,  # maj7
-    12: 7, 13: 8, 14: 8, 17: 10, 21: 12,
-}
-
-
-def _note_name_for_interval(root: str, interval: int, root_octave: int, diatonic_override: int | None = None) -> str:
-    """Return the correctly spelled note name for a chord tone given its interval from root."""
-    letter = root[0].upper()
-    raw_acc = root[1:].replace("♯", "#").replace("♭", "b")
-    root_acc = raw_acc.count("#") - raw_acc.count("b")
-    root_pc = (_LETTER_PC[letter] + root_acc) % 12
-    root_midi = 12 * (root_octave + 1) + root_pc
-
-    target_midi = root_midi + interval
-    target_pc = target_midi % 12
-
-    root_letter_idx = _LETTERS.index(letter)
-    diatonic = diatonic_override if diatonic_override is not None else _INTERVAL_DIATONIC.get(interval, 0)
-    target_letter_idx = (root_letter_idx + diatonic) % 7
-    target_letter = _LETTERS[target_letter_idx]
-    natural_pc = _LETTER_PC[target_letter]
-
-    diff = (target_pc - natural_pc) % 12
-    if diff > 6:
-        diff -= 12
-    acc_str = {-2: "bb", -1: "b", 0: "", 1: "#", 2: "##"}.get(diff, "")
-
-    named_pc_value = natural_pc + diff
-    octave_out = (target_midi - named_pc_value) // 12 - 1
-    return f"{target_letter}{acc_str}{octave_out}"
-
-
-# Diatonic step overrides for interval dyad qualities where the default _INTERVAL_DIATONIC
-# spelling would be wrong (e.g. A4 needs 3 steps for F# not 4 steps for Gb).
-_DYAD_DIATONIC: dict[str, dict[int, int]] = {
-    "A4": {6: 3},   # augmented 4th: C→F# (3 steps), not C→Gb (4 steps)
-    "m6": {8: 5},   # minor 6th: C→Ab (5 steps), not C→G# (4 steps)
-}
-
-
-def chord_note_names(root: str, quality: str, octave: int = 4) -> list[str]:
-    """Return properly spelled note names for a chord, one per interval."""
-    quality = normalize_chord_quality(quality, root=root)
-    intervals = CHORD_INTERVALS.get(quality, [0])
-    overrides = _DYAD_DIATONIC.get(quality, {})
-    return [_note_name_for_interval(root, i, octave, overrides.get(i)) for i in intervals]
-
-
-def build_chord(root: str, quality: str, octave: int = 4) -> list[int]:
-    """Return MIDI note numbers for the given chord/note/interval."""
-    pc = NOTE_NAMES.get(root)
-    if pc is None:
-        raise ValueError(f"Unknown root note: {root!r}. Use names like C, D#, Gb, Bb.")
-    quality = normalize_chord_quality(quality, root=root)
-    intervals = CHORD_INTERVALS.get(quality)
-    if intervals is None:
-        raise ValueError(f"Unknown chord quality: {quality!r}. Supported: {sorted(CHORD_INTERVALS)}")
-    midi_root = 12 * (octave + 1) + pc
-    return [midi_root + i for i in intervals]
 
 
 SOUNDFONT = os.environ.get("SOUNDFONT", str(Path.home() / "Music" / "GeneralUser-GS.sf2"))
@@ -305,7 +116,18 @@ For the play_notes tool, specify:
 
 **Accuracy rule**: Your text description must exactly match the events in your tool call. Never describe notes you didn't play.
 
-Always explain what you're playing so the user learns to connect sound to theory."""
+Always explain what you're playing so the user learns to connect sound to theory.
+
+## Grounding rule for existing pieces
+
+**Never reconstruct an existing named piece from memory.** LLM recall of exact pitches and rhythms is unreliable.
+
+For any named existing piece (folk tune, classical work, hymn, etc.):
+1. Call **search_corpus** first to find it in the bundled corpus.
+2. If found, call **import_corpus** to load the real notes as ABC.
+3. If not found in corpus, tell the user to supply a MIDI, MusicXML, or image file — do not guess the notes.
+
+For original compositions and generic theory demonstrations (scales, chord progressions), freely compose."""
 
 TOOLS = [
     {
@@ -534,6 +356,39 @@ TOOLS = [
                 },
             },
             "required": ["events"],
+        },
+    },
+    {
+        "name": "search_corpus",
+        "description": "Search the bundled music21 corpus (Bach chorales, folk tunes, etc.) for pieces by title or keyword. Returns a list of results; use import_corpus to load one. For existing named pieces, always search here first before reconstructing from memory.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Title keyword or composer/tune name to search for.",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return (default 5, max 20).",
+                    "default": 5,
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "import_corpus",
+        "description": "Load a piece from the bundled music21 corpus by its corpus_path (from search_corpus results). Returns normalized ABC notation and a per-bar report. Use this to get note-accurate versions of existing pieces without relying on recall.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "corpus_path": {
+                    "type": "string",
+                    "description": "The corpus_path from a search_corpus result, e.g. 'bach/bwv1.6.mxl'.",
+                },
+            },
+            "required": ["corpus_path"],
         },
     },
 ]
@@ -1893,6 +1748,70 @@ def chat_stream(req: ChatRequest):
                         "type": "tool_result",
                         "tool_use_id": tool["id"],
                         "content": _sequence_report(sequence, warnings=warnings),
+                    })
+
+                elif tool["name"] == "search_corpus":
+                    from sequencer.midi_io import search_corpus as _search_corpus
+                    inp = tool["input"]
+                    query = inp.get("query", "")
+                    max_results = int(inp.get("max_results", 5))
+                    try:
+                        results = _search_corpus(query, max_results=max_results)
+                    except Exception as e:
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool["id"],
+                            "content": f"Search error: {e}",
+                            "is_error": True,
+                        })
+                        continue
+                    if not results:
+                        content = f"No corpus results for {query!r}."
+                    else:
+                        lines = [f"Found {len(results)} result(s) for {query!r}:"]
+                        for i, r in enumerate(results, 1):
+                            comp = f" ({r['composer']})" if r['composer'] else ""
+                            lines.append(f"{i}. {r['title']}{comp} — corpus_path: {r['corpus_path']!r}")
+                        lines.append("\nUse import_corpus(corpus_path=...) to load one.")
+                        content = "\n".join(lines)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool["id"],
+                        "content": content,
+                    })
+
+                elif tool["name"] == "import_corpus":
+                    from sequencer.midi_io import load_corpus_entry
+                    from sequencer.abc import to_abc, per_bar_report
+                    inp = tool["input"]
+                    corpus_path = inp.get("corpus_path", "")
+                    try:
+                        sequence, dropped = load_corpus_entry(corpus_path)
+                    except Exception as e:
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool["id"],
+                            "content": f"Import error: {e}",
+                            "is_error": True,
+                        })
+                        continue
+
+                    normalized = to_abc(sequence)
+                    bar_msgs = per_bar_report(sequence)
+                    lines = [
+                        f"Imported: {sequence['title']}",
+                        f"Tempo: {sequence['tempo_bpm']} bpm  Meter: {sequence['time_signature']}  Key: {sequence.get('key', 'C')}",
+                        f"Total: {sequence['total_beats']:.4g} beats ({sequence['duration_ms']}ms)",
+                    ]
+                    if dropped:
+                        lines += ["", f"Notes: {dropped}"]
+                    lines += ["", "Per-bar report:"]
+                    lines += (bar_msgs if bar_msgs else ["  All bars correct."])
+                    lines += ["", "Normalized ABC:", normalized]
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool["id"],
+                        "content": "\n".join(lines),
                     })
 
             current_history.append({"role": "user", "content": tool_results})
