@@ -274,7 +274,171 @@ def write_sequence_midi(sequence: dict, sequence_id: str, dest_dir: Path | None 
     return midi_path
 
 
-def _make_event(at_beat: float, duration_beats: float, notes: list[int], note_names: list[str]) -> dict:
+# ── Recording quantizer ───────────────────────────────────────────────────────
+
+def quantize_recording(
+    raw_events: list[dict],
+    tempo_bpm: float = 120.0,
+    time_signature: str = "4/4",
+    grid: float = 0.25,  # grid in beats (0.25 = 1/16th note)
+) -> dict:
+    """Convert raw MIDI capture events to a sequence dict.
+
+    raw_events: list of {note, on (bool), t (float, monotonic seconds), velocity}
+    Returns a sequence dict in the same shape as parse_abc(), plus a 'raw_events' key.
+
+    Algorithm:
+    - Pair note_on with note_off (velocity-0 note_on treated as note_off)
+    - t0 = first note_on timestamp (so piece starts at beat 0)
+    - Convert timestamps to beats using tempo_bpm
+    - Snap onset and duration to nearest grid cell
+    - Group simultaneous onsets (same grid cell) into chord events
+    """
+    if not raw_events:
+        raise ValueError("No events to quantize")
+
+    sec_per_beat = 60.0 / tempo_bpm
+
+    # Separate on/off, treating velocity-0 as off
+    ons: dict[int, list[tuple[float, int]]] = {}   # note -> [(t, velocity), ...]
+    offs: dict[int, list[float]] = {}               # note -> [t, ...]
+
+    for ev in raw_events:
+        note = ev["note"]
+        t = ev["t"]
+        is_on = ev.get("on", True) and ev.get("velocity", 1) > 0
+        if is_on:
+            ons.setdefault(note, []).append((t, ev.get("velocity", 90)))
+        else:
+            offs.setdefault(note, []).append(t)
+
+    # Find t0 from first note_on
+    all_on_times = [t for times in ons.values() for t, _ in times]
+    if not all_on_times:
+        raise ValueError("No note_on events found")
+    t0 = min(all_on_times)
+
+    def to_beat(t: float) -> float:
+        return (t - t0) / sec_per_beat
+
+    def snap(beat: float) -> float:
+        return round(beat / grid) * grid
+
+    # Build note instances: (on_beat_raw, off_beat_raw, note, velocity)
+    instances: list[tuple[float, float, int, int]] = []
+    for note, on_list in sorted(ons.items()):
+        off_list = sorted(offs.get(note, []))
+        for i, (ton, vel) in enumerate(sorted(on_list, key=lambda x: x[0])):
+            # Find first off after this on
+            toff = None
+            for tof in off_list:
+                if tof > ton:
+                    toff = tof
+                    off_list = [x for x in off_list if x != toff or off_list.index(x) != off_list.index(toff)]
+                    break
+            if toff is None:
+                toff = ton + sec_per_beat  # default 1 beat if no off found
+            instances.append((to_beat(ton), to_beat(toff), note, vel))
+
+    if not instances:
+        raise ValueError("No complete note instances found")
+
+    # Snap to grid; minimum duration = 1 grid cell
+    snapped: list[tuple[float, float, int, int]] = []
+    for on_b, off_b, note, vel in instances:
+        s_on = snap(on_b)
+        dur = max(grid, snap(off_b - on_b))
+        snapped.append((s_on, dur, note, vel))
+
+    # Group by onset into events (chords share the same onset beat)
+    from collections import defaultdict
+    onset_groups: dict[float, list[tuple[float, int, int]]] = defaultdict(list)
+    for s_on, dur, note, vel in snapped:
+        onset_groups[s_on].append((dur, note, vel))
+
+    ts_num, ts_den = (int(x) for x in time_signature.split("/"))
+
+    events: list[dict] = []
+    for onset in sorted(onset_groups):
+        group = onset_groups[onset]
+        # All share the same onset; use median duration for the group
+        dur = sorted(d for d, _, _ in group)[len(group) // 2]
+        notes_list = sorted(set(n for _, n, _ in group))
+        vel = max(v for _, _, v in group)
+        from sequencer.theory import midi_note_name as _mnn
+        note_names = [_mnn(n, False) for n in notes_list]
+        events.append(_make_event(onset, dur, notes_list, note_names, velocity=vel))
+
+    if not events:
+        raise ValueError("Quantization produced no events")
+
+    total_beats = max(e["at_beat"] + e["duration_beats"] for e in events)
+    duration_ms = int(total_beats * sec_per_beat * 1000)
+
+    return {
+        "title": "Recording",
+        "tempo_bpm": float(tempo_bpm),
+        "time_signature": time_signature,
+        "time_signature_parts": (ts_num, ts_den),
+        "key": "C",
+        "events": events,
+        "total_beats": total_beats,
+        "duration_ms": duration_ms,
+        "abc_errors": [],
+        "raw_events": raw_events,
+    }
+
+
+def timing_report(raw_events: list[dict], sequence: dict) -> list[dict]:
+    """Generate per-note timing deviation report (quantized vs raw).
+
+    Returns list of {note_name, bar, beat, deviation_ms, early_or_late}.
+    """
+    if not raw_events or not sequence.get("events"):
+        return []
+
+    tempo_bpm = sequence["tempo_bpm"]
+    sec_per_beat = 60.0 / tempo_bpm
+    ts_num, ts_den = sequence["time_signature_parts"]
+    beats_per_bar = ts_num * 4 / ts_den
+
+    ons: list[tuple[float, int, int]] = []
+    for ev in raw_events:
+        if ev.get("on", True) and ev.get("velocity", 1) > 0:
+            ons.append((ev["t"], ev["note"], ev.get("velocity", 90)))
+
+    if not ons:
+        return []
+
+    t0 = min(t for t, _, _ in ons)
+
+    report = []
+    for ev in sequence["events"]:
+        grid_beat = ev["at_beat"]
+        for midi_note in ev["notes"]:
+            # Find closest raw on for this note
+            candidates = [(t, n, v) for t, n, v in ons if n == midi_note]
+            if not candidates:
+                continue
+            raw_t = min(candidates, key=lambda x: abs((x[0] - t0) / sec_per_beat - grid_beat))[0]
+            raw_beat = (raw_t - t0) / sec_per_beat
+            dev_ms = (raw_beat - grid_beat) * sec_per_beat * 1000
+            bar = int(grid_beat / beats_per_bar) + 1
+            beat_in_bar = (grid_beat % beats_per_bar) + 1
+
+            from sequencer.theory import midi_note_name as _mnn
+            report.append({
+                "note_name": _mnn(midi_note, False),
+                "bar": bar,
+                "beat": round(beat_in_bar, 2),
+                "deviation_ms": round(dev_ms, 1),
+                "early_or_late": "early" if dev_ms < 0 else ("late" if dev_ms > 0 else "on-time"),
+            })
+
+    return report
+
+
+def _make_event(at_beat: float, duration_beats: float, notes: list[int], note_names: list[str], velocity: int = 90) -> dict:
     root = note_names[0][:-1] if note_names and note_names[0][-1:].isdigit() else (note_names[0] if note_names else "C")
     octave = notes[0] // 12 - 1 if notes else 4
     return {
@@ -285,6 +449,6 @@ def _make_event(at_beat: float, duration_beats: float, notes: list[int], note_na
         "root": root,
         "quality": "note" if len(notes) == 1 else "chord",
         "octave": octave,
-        "velocity": 90,
+        "velocity": velocity,
         "label": note_names[0] if note_names else "",
     }

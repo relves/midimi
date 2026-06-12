@@ -9,6 +9,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+_JSON = json  # alias to avoid shadowing
+
 # Injected at startup (same DB_PATH used by server.py)
 _db_path: Path | None = None
 
@@ -49,6 +51,11 @@ def _create_tables() -> None:
                 created_at INTEGER
             )
         """)
+        # Phase 4: raw_events column for recordings
+        try:
+            conn.execute("ALTER TABLE sequences ADD COLUMN raw_events TEXT")
+        except Exception:
+            pass
         conn.commit()
 
 
@@ -63,16 +70,18 @@ def create_sequence(
     time_signature: str = "4/4",
     key: str = "C",
     source: str = "agent",
+    raw_events: list | None = None,
 ) -> str:
     """Insert a new sequence, store initial revision, return its id."""
     seq_id = str(uuid.uuid4())[:8]
     now = int(time.time())
+    raw_json = _JSON.dumps(raw_events) if raw_events is not None else None
     with _conn() as conn:
         conn.execute(
             """INSERT INTO sequences
-               (id, session_id, title, abc, tempo_bpm, time_signature, key, source, created_at, modified_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (seq_id, session_id, title, abc, tempo_bpm, time_signature, key, source, now, now),
+               (id, session_id, title, abc, tempo_bpm, time_signature, key, source, raw_events, created_at, modified_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (seq_id, session_id, title, abc, tempo_bpm, time_signature, key, source, raw_json, now, now),
         )
         conn.execute(
             "INSERT INTO sequence_revisions (sequence_id, abc, created_at) VALUES (?,?,?)",
@@ -85,16 +94,17 @@ def create_sequence(
 def get_sequence(seq_id: str) -> dict[str, Any] | None:
     with _conn() as conn:
         row = conn.execute(
-            "SELECT id, session_id, title, abc, tempo_bpm, time_signature, key, source, created_at, modified_at "
+            "SELECT id, session_id, title, abc, tempo_bpm, time_signature, key, source, raw_events, created_at, modified_at "
             "FROM sequences WHERE id=?",
             (seq_id,),
         ).fetchone()
     if not row:
         return None
+    raw_events = _JSON.loads(row[8]) if row[8] else None
     return {
         "id": row[0], "session_id": row[1], "title": row[2], "abc": row[3],
         "tempo_bpm": row[4], "time_signature": row[5], "key": row[6],
-        "source": row[7], "created_at": row[8], "modified_at": row[9],
+        "source": row[7], "raw_events": raw_events, "created_at": row[9], "modified_at": row[10],
     }
 
 

@@ -34,6 +34,103 @@ def current_port() -> str | None:
     return _current_port
 
 
+# ── MIDI input / monitoring / recording ───────────────────────────────────────
+
+_input_port_name: str | None = None
+_input_port: mido.ports.BaseInput | None = None
+_input_thread: threading.Thread | None = None
+_input_stop = threading.Event()
+
+# Recording state
+_recording_lock = threading.Lock()
+_recording: bool = False
+_record_buf: list[dict] = []
+
+
+def current_input_port() -> str | None:
+    return _input_port_name
+
+
+def start_input(port_name: str) -> None:
+    """Open a MIDI input port. Monitoring (hear yourself) always on; recording is separate."""
+    global _input_port_name, _input_port, _input_thread
+    stop_input()
+    try:
+        port = mido.open_input(port_name)
+    except Exception as exc:
+        raise RuntimeError(f"Could not open MIDI input '{port_name}': {exc}") from exc
+    _input_port = port
+    _input_port_name = port_name
+    _input_stop.clear()
+    _input_thread = threading.Thread(target=_input_loop, args=(port,), daemon=True)
+    _input_thread.start()
+    print(f"MIDI in:  {port_name}")
+
+
+def stop_input() -> None:
+    """Close the current MIDI input port."""
+    global _input_port_name, _input_port, _input_thread
+    _input_stop.set()
+    if _input_port is not None:
+        try:
+            _input_port.close()
+        except Exception:
+            pass
+        _input_port = None
+    _input_port_name = None
+    _input_thread = None
+
+
+def arm_recording() -> None:
+    with _recording_lock:
+        global _recording, _record_buf
+        _record_buf = []
+        _recording = True
+
+
+def stop_recording() -> list[dict]:
+    """Disarm recording and return captured events."""
+    with _recording_lock:
+        global _recording
+        _recording = False
+        events = list(_record_buf)
+    return events
+
+
+def _input_loop(port: mido.ports.BaseInput) -> None:
+    """Listen on input port; play through to synth; capture when recording."""
+    while not _input_stop.is_set():
+        for msg in port.iter_pending():
+            if msg.type == "note_on":
+                is_on = msg.velocity > 0
+                if is_on:
+                    if _note_on_fn:
+                        _note_on_fn(msg.note, msg.velocity, DEFAULT_CHANNEL)
+                else:
+                    if _note_off_fn:
+                        _note_off_fn(msg.note, DEFAULT_CHANNEL)
+                with _recording_lock:
+                    if _recording:
+                        _record_buf.append({
+                            "note": msg.note,
+                            "on": is_on,
+                            "velocity": msg.velocity,
+                            "t": time.monotonic(),
+                        })
+            elif msg.type == "note_off":
+                if _note_off_fn:
+                    _note_off_fn(msg.note, DEFAULT_CHANNEL)
+                with _recording_lock:
+                    if _recording:
+                        _record_buf.append({
+                            "note": msg.note,
+                            "on": False,
+                            "velocity": 0,
+                            "t": time.monotonic(),
+                        })
+        time.sleep(0.002)  # 2 ms poll — low latency without busy-spin
+
+
 # ── Initializers ──────────────────────────────────────────────────────────────
 
 def set_note_fns(
@@ -255,6 +352,55 @@ def _run_sequence(sequence_id: str, sequence: dict, bars: str | None) -> None:
             finally:
                 for note in sounding:
                     _note_off_fn(note, DEFAULT_CHANNEL)
+    finally:
+        with _currently_playing_lock:
+            _currently_playing.discard(sequence_id)
+
+
+def play_raw_recording_bg(sequence_id: str, raw_events: list[dict]) -> None:
+    """Replay raw capture timestamps verbatim (unquantized).
+
+    raw_events: list of {note, on, velocity, t (monotonic seconds from capture)}
+    """
+    threading.Thread(target=_run_raw, args=(sequence_id, raw_events), daemon=True).start()
+
+
+def _run_raw(sequence_id: str, raw_events: list[dict]) -> None:
+    sorted_evs = sorted(raw_events, key=lambda e: e["t"])
+    if not sorted_evs:
+        return
+    t0_cap = sorted_evs[0]["t"]
+
+    with _currently_playing_lock:
+        _currently_playing.add(sequence_id)
+    try:
+        with _play_lock:
+            _stop_event.clear()
+            t0_play = time.monotonic()
+            sounding: list[int] = []
+            try:
+                for ev in sorted_evs:
+                    if _stop_event.is_set():
+                        break
+                    target = t0_play + (ev["t"] - t0_cap)
+                    sleep_for = target - time.monotonic()
+                    if sleep_for > 0:
+                        _stop_event.wait(sleep_for)
+                    if _stop_event.is_set():
+                        break
+                    if ev.get("on", True) and ev.get("velocity", 1) > 0:
+                        if _note_on_fn:
+                            _note_on_fn(ev["note"], ev.get("velocity", DEFAULT_VELOCITY), DEFAULT_CHANNEL)
+                        sounding.append(ev["note"])
+                    else:
+                        if _note_off_fn:
+                            _note_off_fn(ev["note"], DEFAULT_CHANNEL)
+                        if ev["note"] in sounding:
+                            sounding.remove(ev["note"])
+            finally:
+                for note in sounding:
+                    if _note_off_fn:
+                        _note_off_fn(note, DEFAULT_CHANNEL)
     finally:
         with _currently_playing_lock:
             _currently_playing.discard(sequence_id)

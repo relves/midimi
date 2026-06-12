@@ -118,7 +118,13 @@ For any named existing piece (folk tune, classical work, hymn, etc.):
 2. If found, call **import_corpus** to load the real notes as ABC.
 3. If not found in corpus, tell the user to supply a MIDI, MusicXML, or image file — do not guess the notes.
 
-For original compositions and generic theory demonstrations (scales, chord progressions), freely compose."""
+For original compositions and generic theory demonstrations (scales, chord progressions), freely compose.
+
+## Recording critique
+
+When a recording appears (a sequence with source='recording'), use **read_sequence** to see the quantized notes *and* timing deviations before commenting. Critique both:
+- **Note choice** — are the notes in the stated key/scale/target piece?
+- **Timing** — use the per-note ms deviation table (early/late) to give specific feedback, e.g. "bar 2 beat 3 was 45 ms early." Focus on patterns (consistently rushing, late entries) rather than listing every note."""
 
 # ── Tool schemas ──────────────────────────────────────────────────────────────
 
@@ -924,6 +930,16 @@ def dispatch_tools(
                 "", "Per-bar report:",
             ]
             lines += (bar_msgs if bar_msgs else ["  All bars correct."])
+            # Timing report for recordings
+            if row.get("source") == "recording" and row.get("raw_events"):
+                from sequencer.midi_io import timing_report
+                t_report = timing_report(row["raw_events"], sequence)
+                if t_report:
+                    lines += ["", "Timing deviation (vs quantized grid):"]
+                    for tr in t_report[:32]:  # cap at 32 entries
+                        sign = "early" if tr["deviation_ms"] < 0 else ("late" if tr["deviation_ms"] > 0 else "on-time")
+                        lines.append(f"  bar {tr['bar']} beat {tr['beat']} {tr['note_name']}: "
+                                     f"{abs(tr['deviation_ms']):.0f}ms {sign}")
             lines += ["", "Normalized ABC:", normalized]
             yield _ok("\n".join(lines))
 

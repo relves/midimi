@@ -676,6 +676,66 @@
     }
     #model-select:focus, #model-select:hover { border-color: var(--accent); color: var(--text); }
     #model-select option { background: var(--surface2); }
+
+    #input-port-select {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      color: var(--text);
+      font-size: 0.9rem;
+      outline: none;
+      cursor: pointer;
+    }
+    #input-port-select:focus { border-color: var(--accent); }
+
+    #record-controls {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    #record-bpm {
+      width: 60px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0 8px;
+      color: var(--text);
+      font-size: 0.8rem;
+      height: 44px;
+      outline: none;
+      text-align: center;
+    }
+    #record-bpm:focus { border-color: var(--accent); }
+
+    #record-btn {
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0 12px;
+      color: var(--text-dim);
+      font-size: 0.85rem;
+      cursor: pointer;
+      height: 44px;
+      transition: border-color 0.15s, color 0.15s, background 0.15s;
+      flex-shrink: 0;
+    }
+    #record-btn:hover { border-color: #e07070; color: #e07070; }
+    #record-btn.recording { border-color: #e07070; background: rgba(224,112,112,0.15); color: #e07070; animation: pulse-rec 1s infinite; }
+
+    @keyframes pulse-rec {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    #record-status {
+      font-size: 0.75rem;
+      color: var(--text-dim);
+      min-width: 60px;
+    }
   </style>
 </head>
 <body>
@@ -696,6 +756,10 @@
       <div>
         <div class="config-label">Audio output device</div>
         <select id="port-select"></select>
+      </div>
+      <div>
+        <div class="config-label">MIDI input (controller)</div>
+        <select id="input-port-select"></select>
       </div>
       <div id="config-status"></div>
       <div class="modal-actions">
@@ -755,6 +819,12 @@
           id="send-btn"
           data-on-click="sendMessage()"
         >Send</button>
+
+        <div id="record-controls">
+          <input id="record-bpm" type="number" min="40" max="300" value="120" title="Tempo (BPM)" />
+          <button id="record-btn" onclick="toggleRecord()" title="Record from MIDI controller">&#9679; Rec</button>
+          <span id="record-status"></span>
+        </div>
       </div>
     </div>
   </div>
@@ -1358,6 +1428,17 @@
           sel.appendChild(opt);
         }
         if (!data.current_port) sel.value = '';
+
+        const isel = document.getElementById('input-port-select');
+        isel.innerHTML = '<option value="">None (monitoring off)</option>';
+        for (const p of (data.input_ports || [])) {
+          const opt = document.createElement('option');
+          opt.value = p;
+          opt.textContent = p;
+          if (p === data.current_input_port) opt.selected = true;
+          isel.appendChild(opt);
+        }
+        if (!data.current_input_port) isel.value = '';
       } catch (e) {
         console.error(e);
       }
@@ -1376,12 +1457,14 @@
     async function applyConfig() {
       const sel = document.getElementById('port-select');
       const port = sel.value || null;
+      const isel = document.getElementById('input-port-select');
+      const inputPort = isel.value;  // "" means disable
       const apiKey = document.getElementById('api-key-input').value.trim();
       const status = document.getElementById('config-status');
       status.textContent = 'Saving…';
       status.className = '';
 
-      const body = { port };
+      const body = { port, input_port: inputPort };
       if (apiKey) body.api_key = apiKey;
 
       try {
@@ -1585,6 +1668,85 @@
     }
 
     initComposerEvents();
+
+    // ── Recording ────────────────────────────────────────────────────────────
+
+    let _recording = false;
+    let _recordBpm = 120;
+    let _recordTimeSignature = '4/4';
+
+    async function toggleRecord() {
+      if (_recording) {
+        await stopRecord();
+      } else {
+        await startRecord();
+      }
+    }
+
+    async function startRecord() {
+      if (!sessionId) { alert('Start a chat session first.'); return; }
+      _recordBpm = parseInt(document.getElementById('record-bpm').value, 10) || 120;
+      try {
+        const r = await fetch('/record/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sessionId, tempo_bpm: _recordBpm, time_signature: _recordTimeSignature }),
+        });
+        const data = await r.json();
+        if (r.ok && data.ok) {
+          _recording = true;
+          const btn = document.getElementById('record-btn');
+          btn.classList.add('recording');
+          btn.textContent = '⏹ Stop';
+          document.getElementById('record-status').textContent = 'Recording…';
+        } else {
+          alert(data.detail || 'Could not start recording. Is a MIDI input port selected in Settings?');
+        }
+      } catch (e) {
+        console.error(e);
+        alert('Recording failed to start.');
+      }
+    }
+
+    async function stopRecord() {
+      _recording = false;
+      const btn = document.getElementById('record-btn');
+      btn.classList.remove('recording');
+      btn.innerHTML = '&#9679; Rec';
+      document.getElementById('record-status').textContent = 'Processing…';
+
+      _recordBpm = parseInt(document.getElementById('record-bpm').value, 10) || 120;
+      try {
+        const r = await fetch('/record/stop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            session_id: sessionId,
+            tempo_bpm: _recordBpm,
+            time_signature: _recordTimeSignature,
+            title: 'Recording',
+          }),
+        });
+        const data = await r.json();
+        document.getElementById('record-status').textContent = '';
+        if (r.ok && data.ok) {
+          // Inject pill into transcript
+          const transcript = document.getElementById('transcript');
+          const wrap = document.createElement('div');
+          wrap.className = 'msg msg-assistant';
+          wrap.innerHTML = `<div class="bubble">${data.pill_html}</div>`;
+          transcript.appendChild(wrap);
+          transcript.scrollTop = transcript.scrollHeight;
+          document.getElementById('empty-state')?.remove();
+        } else {
+          alert(data.detail || 'Recording could not be quantized. No notes captured?');
+        }
+      } catch (e) {
+        console.error(e);
+        document.getElementById('record-status').textContent = '';
+        alert('Recording failed.');
+      }
+    }
   </script>
 </body>
 </html>

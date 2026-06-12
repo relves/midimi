@@ -266,6 +266,21 @@ _play, _current_port, _note_on, _note_off = _init_player()
 engine.set_note_fns(_note_on, _note_off, _play, _current_port)
 
 
+def _init_input_from_settings():
+    midi_in = (db_get_setting("midi_in") or "").strip()
+    if midi_in:
+        available = mido.get_input_names()
+        matches = [p for p in available if midi_in.lower() in p.lower()]
+        if matches:
+            try:
+                engine.start_input(matches[0])
+            except Exception as e:
+                print(f"Warning: could not open saved MIDI input '{matches[0]}': {e}")
+
+
+_init_input_from_settings()
+
+
 def db_update_session_modified(session_id: str):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("UPDATE sessions SET modified_at=? WHERE id=?", (int(time.time()), session_id))
@@ -493,11 +508,6 @@ def test_output(req: TestRequest):
     return result
 
 
-class SettingsRequest(BaseModel):
-    api_key: str | None = None
-    port: str | None = None
-
-
 @app.get("/settings")
 def get_settings():
     api_key = db_get_setting("api_key")
@@ -505,7 +515,15 @@ def get_settings():
         "api_key_set": bool(api_key),
         "current_port": _current_port,
         "ports": mido.get_output_names(),
+        "current_input_port": engine.current_input_port(),
+        "input_ports": mido.get_input_names(),
     }
+
+
+class SettingsRequest(BaseModel):
+    api_key: str | None = None
+    port: str | None = None
+    input_port: str | None = None  # None = no change, "" = disable
 
 
 @app.post("/settings")
@@ -516,6 +534,16 @@ def save_settings(req: SettingsRequest):
         _anthropic_client = None  # force re-init with new key
     if "port" in req.model_fields_set:
         set_config(ConfigRequest(port=req.port))
+    if "input_port" in req.model_fields_set:
+        if req.input_port == "" or req.input_port is None:
+            engine.stop_input()
+            db_set_setting("midi_in", None)
+        else:
+            available = mido.get_input_names()
+            if req.input_port not in available:
+                raise HTTPException(400, f"Input port '{req.input_port}' not found. Available: {available}")
+            engine.start_input(req.input_port)
+            db_set_setting("midi_in", req.input_port)
     return {"ok": True, "api_key_set": bool(db_get_setting("api_key"))}
 
 
@@ -662,6 +690,94 @@ def play_single_midi(note: int):
         raise HTTPException(400, "MIDI note must be 0–127")
     play_in_background([note], 800)
     return {"ok": True}
+
+
+# ── Recording endpoints ───────────────────────────────────────────────────────
+
+class RecordStartRequest(BaseModel):
+    session_id: str
+    tempo_bpm: float = 120.0
+    time_signature: str = "4/4"
+
+
+class RecordStopRequest(BaseModel):
+    session_id: str
+    tempo_bpm: float = 120.0
+    time_signature: str = "4/4"
+    title: str = "Recording"
+    grid: float = 0.25  # quantization grid in beats (0.25 = 1/16th)
+    quantize: bool = True
+
+
+@app.post("/record/start")
+def record_start(req: RecordStartRequest):
+    if engine.current_input_port() is None:
+        raise HTTPException(400, "No MIDI input port selected. Open Settings to choose one.")
+    engine.arm_recording()
+    return {"ok": True, "recording": True}
+
+
+@app.post("/record/stop")
+def record_stop(req: RecordStopRequest):
+    from sequencer.midi_io import quantize_recording, timing_report
+    from sequencer.abc import to_abc
+
+    raw_events = engine.stop_recording()
+    if not raw_events:
+        raise HTTPException(400, "No notes were recorded.")
+
+    try:
+        seq_dict = quantize_recording(
+            raw_events,
+            tempo_bpm=req.tempo_bpm,
+            time_signature=req.time_signature,
+            grid=req.grid,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    seq_dict["title"] = req.title
+    abc_text = to_abc(seq_dict)
+
+    seq_id = seq_model.create_sequence(
+        title=req.title,
+        abc=abc_text,
+        session_id=req.session_id,
+        tempo_bpm=req.tempo_bpm,
+        time_signature=req.time_signature,
+        source="recording",
+        raw_events=raw_events,
+    )
+
+    # Build pill for injection into chat
+    midi_path = write_sequence_midi(seq_dict, seq_id)
+    midi_url = f"/sequence/{seq_id}/download"
+    duration_ms = seq_dict.get("duration_ms", 1000)
+    pill_html = sequence_pill(seq_id, req.title, f"pill-{seq_id}", duration_ms, midi_url, seq_dict["events"])
+
+    # Persist to chat history so it survives reload
+    record_entry = {
+        "type": "sequence",
+        "sequence_id": seq_id,
+        "title": req.title,
+        "duration_ms": duration_ms,
+        "sequence": seq_dict,
+        "midi_path": str(midi_path),
+        "source": "recording",
+    }
+    db_save_message(req.session_id, "assistant", [record_entry])
+    db_update_session_modified(req.session_id)
+
+    t_report = timing_report(raw_events, seq_dict)
+
+    return {
+        "ok": True,
+        "sequence_id": seq_id,
+        "abc": abc_text,
+        "pill_html": pill_html,
+        "timing_report": t_report,
+        "duration_ms": duration_ms,
+    }
 
 
 @app.get("/playing")
@@ -916,6 +1032,10 @@ def chat_stream(req: ChatRequest):
             seg_text = ""
             yield ds_merge_fragment(
                 f'<span id="{seg_id}"></span>',
+                selector=f"#{asst_msg_id} .bubble",
+            )
+            yield ds_merge_fragment(
+                f'<span class="thinking-spinner"></span>',
                 selector=f"#{asst_msg_id} .bubble",
             )
 
