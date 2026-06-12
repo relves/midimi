@@ -303,3 +303,338 @@ def _midi_to_name(midi: int, prefer_flats: bool = False) -> str:
 def midi_note_name(n: int, prefer_flats: bool = False) -> str:
     """Public alias for _midi_to_name."""
     return _midi_to_name(n, prefer_flats)
+
+
+# ── Low-interval limits (LIL) ─────────────────────────────────────────────────
+# Each entry: (interval_semitones, min_midi_for_lower_note)
+# Below the min, the lower note must be pushed up an octave.
+# Source: standard orchestration LIL tables.
+
+_LIL: list[tuple[int, int]] = [
+    (1,  None),  # m2  — avoid in low register entirely; push up to stay above E3
+    (2,  None),  # M2
+    (3,  52),    # m3  — no lower note below E3 (MIDI 52)
+    (4,  48),    # M3  — no lower note below C3 (MIDI 48)
+    (5,  47),    # P4  — no lower note below B2 (MIDI 47)
+    (6,  None),  # A4/tritone
+    (7,  None),  # P5  — open 5th, always OK
+    (8,  None),
+    (9,  None),
+    (10, None),
+    (11, None),
+]
+
+# Map interval semitones to LIL threshold MIDI for lower note
+_LIL_THRESHOLD: dict[int, int] = {semi: threshold for semi, threshold in _LIL if threshold is not None}
+
+
+def _enforce_lil(lower_midi: int, upper_midi: int) -> int:
+    """Return (possibly octave-raised) lower_midi that satisfies LIL with upper."""
+    interval = (upper_midi - lower_midi) % 12
+    threshold = _LIL_THRESHOLD.get(interval)
+    if threshold is not None:
+        while lower_midi < threshold:
+            lower_midi += 12
+    return lower_midi
+
+
+# ── Voicing helper ────────────────────────────────────────────────────────────
+
+def _midi_to_abc_token(midi: int, name: str) -> str:
+    """Convert MIDI + note name to an ABC note token (letter+acc+octave, no duration)."""
+    m = re.match(r'^([A-G])(#{1,2}|b{1,2})?(-?\d+)$', name)
+    if not m:
+        octave = midi // 12 - 1
+        pc = midi % 12
+        letter = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'][pc]
+        acc_str = ''
+    else:
+        letter = m.group(1)
+        acc_str = (m.group(2) or '').replace('#', '^').replace('b', '_')
+        octave = int(m.group(3))
+    if octave == 3:
+        return f"{acc_str}{letter.upper()}"
+    elif octave == 4:
+        return f"{acc_str}{letter.lower()}"
+    elif octave > 4:
+        return f"{acc_str}{letter.lower()}{''.join([chr(39)] * (octave - 4))}"
+    else:
+        return f"{acc_str}{letter.upper()}{',' * (3 - octave)}"
+
+
+def _place_close(pcs: list[int], bottom_midi: int) -> list[int]:
+    """Stack pitch-classes into close voicing starting at or above bottom_midi."""
+    result = []
+    current = bottom_midi
+    for i, pc in enumerate(pcs):
+        diff = (pc - current % 12) % 12
+        if i > 0 and diff == 0:
+            diff = 12  # avoid unison with previous note
+        note = current + diff
+        result.append(note)
+        current = note
+    return result
+
+
+def voice_chord(
+    root: str,
+    quality: str,
+    melody_note: str | None = None,
+    register: str = "mid",
+    style: str = "close",
+    omit_root: bool = False,
+    _center_midi: int | None = None,
+    _rotation: int = 0,
+) -> dict:
+    """Return a concrete chord voicing.
+
+    Parameters
+    ----------
+    root : str
+        Root note, e.g. "C", "F#", "Bb"
+    quality : str
+        Chord quality, e.g. "major7", "dominant7"
+    melody_note : str | None
+        Note name+octave, e.g. "G5".  When given, the top voicing note sits
+        a 3rd-6th below the melody note and does not double it.
+    register : str
+        "low" | "mid" | "high" -- center target when no melody_note.
+    style : str
+        "close" | "drop2" | "shell" | "spread"
+    omit_root : bool
+        Drop the root (bass voice has it); keeps 3rd and 7th.
+
+    Returns
+    -------
+    dict with keys:
+        notes (list[str])  -- note names bottom to top, e.g. ["G3","B3","D4","F4"]
+        midi  (list[int])  -- MIDI numbers bottom to top
+        abc   (str)        -- ready-to-paste ABC chord token, e.g. "[GBdf]"
+    """
+    quality = normalize_chord_quality(quality, root=root)
+    intervals = CHORD_INTERVALS.get(quality)
+    if intervals is None:
+        raise ValueError(f"Unknown chord quality: {quality!r}")
+
+    melody_midi: int | None = None
+    if melody_note:
+        _, _, melody_midi = parse_pitch(melody_note)
+
+    prefer_flats = root in _FLAT_ROOTS
+    root_pc = NOTE_NAMES.get(root)
+    if root_pc is None:
+        raise ValueError(f"Unknown root: {root!r}")
+
+    # Build tone pitch-classes in chord order
+    tone_pcs = [(root_pc + s) % 12 for s in intervals]
+
+    if omit_root and len(tone_pcs) > 2:
+        tone_pcs = tone_pcs[1:]
+
+    if style == "shell":
+        if len(intervals) >= 4:
+            keep = [0, 1, 3] if not omit_root else [0, 2]
+        else:
+            keep = list(range(min(3, len(tone_pcs))))
+        tone_pcs = [tone_pcs[i] for i in keep if i < len(tone_pcs)]
+
+    # Inversion: rotate so a non-root tone is at the bottom
+    if _rotation and len(tone_pcs) > 1:
+        rot = _rotation % len(tone_pcs)
+        tone_pcs = tone_pcs[rot:] + tone_pcs[:rot]
+
+    # Determine target register
+    _REGISTER_CENTER = {"low": 45, "mid": 57, "high": 69}
+    if _center_midi is not None:
+        center = _center_midi
+    else:
+        center = _REGISTER_CENTER.get(register, 57)
+
+    if melody_midi is not None:
+        # Target: top note a M3 below melody (range 3-6 semitones below)
+        top_target = melody_midi - 4
+        bottom_target = top_target - (len(tone_pcs) - 1) * 4
+    else:
+        # Center the voicing centroid at `center`; span ≈ (n-1)*3.5 semitones
+        half_span = int((len(tone_pcs) - 1) * 1.75)
+        bottom_target = center - half_span
+        top_target = center + half_span  # informational only
+
+    # Snap bottom to nearest instance of first PC at or above bottom_target
+    first_pc = tone_pcs[0]
+    diff = (first_pc - bottom_target % 12) % 12
+    bottom = bottom_target + diff
+    if bottom < 24:
+        bottom += 12
+
+    # Build voicing
+    if style == "drop2" and len(tone_pcs) >= 4:
+        raw = _place_close(tone_pcs, bottom)
+        raw[-2] -= 12
+    elif style == "spread" and len(tone_pcs) >= 3:
+        raw = _place_close(tone_pcs, bottom - 6)
+    else:
+        raw = _place_close(tone_pcs, bottom)
+
+    placed = sorted(raw)
+
+    # LIL enforcement from bottom up
+    for i in range(len(placed) - 1):
+        placed[i] = _enforce_lil(placed[i], placed[i + 1])
+    placed.sort()
+
+    # Melody avoidance: remove notes that double the melody PC, push top below melody
+    if melody_midi is not None:
+        melody_pc = melody_midi % 12
+        filtered = [n for n in placed if n % 12 != melody_pc]
+        if not filtered:
+            filtered = placed  # fallback: skip doubling check
+
+        # Push any notes at or above melody down by octave(s)
+        filtered = [n - 12 * max(0, (n - melody_midi + 11) // 12 + 1)
+                    if n >= melody_midi else n for n in filtered]
+        placed = sorted(filtered)
+
+        # Top note must be at least m3 below melody
+        if placed and melody_midi - placed[-1] < 3:
+            placed[-1] -= 12
+            placed.sort()
+
+    note_names = [_midi_to_name(m, prefer_flats) for m in placed]
+    abc_inner = ''.join(_midi_to_abc_token(m, n) for m, n in zip(placed, note_names))
+
+    return {
+        "notes": note_names,
+        "midi": placed,
+        "abc": f"[{abc_inner}]",
+    }
+
+
+def voice_progression(
+    chords: list[dict],
+    melody: list[str | None] | None = None,
+    style: str = "close",
+) -> dict:
+    """Voice a chord progression with minimal-motion voice leading.
+
+    Parameters
+    ----------
+    chords : list[dict]
+        Each entry: {symbol: "Cmaj7", beats: 4, melody_note: "e'4"} (melody_note optional).
+        symbol is parsed as root+quality.
+    melody : list[str|None] | None
+        Optional per-chord melody note list (overrides melody_note in chords).
+    style : str
+        "close" | "drop2" | "shell" | "spread"
+
+    Returns
+    -------
+    dict with keys:
+        voicings (list[dict])  -- per-chord: {symbol, beats, notes, midi, abc}
+        abc_line (str)         -- one ABC line per chord, suitable for a [V:2] voice
+    """
+    if not chords:
+        return {"voicings": [], "abc_line": ""}
+
+    voicings: list[dict] = []
+    prev_midis: list[int] | None = None
+
+    for i, chord_entry in enumerate(chords):
+        symbol = chord_entry.get("symbol", "Cmaj7")
+        beats = chord_entry.get("beats", 4)
+        mel = (melody[i] if melody and i < len(melody) else None) or chord_entry.get("melody_note")
+
+        # Parse symbol into root + quality
+        root, quality = _parse_chord_symbol_to_root_quality(symbol)
+
+        # Try all inversions/registers; pick the one with minimum motion from prev
+        if prev_midis is None:
+            result = voice_chord(root, quality, melody_note=mel, style=style)
+        else:
+            # Voice near the centroid of the previous chord; try all
+            # inversions (rotations) × octave offsets for minimal motion.
+            prev_center = int(sum(prev_midis) / len(prev_midis))
+            n_tones = len(CHORD_INTERVALS.get(
+                normalize_chord_quality(quality, root=root), [0]))
+            candidates = []
+            for rotation in range(max(1, n_tones)):
+                for center_offset in (0, 12, -12, 6, -6):
+                    try:
+                        r = voice_chord(
+                            root, quality, melody_note=mel, style=style,
+                            _center_midi=prev_center + center_offset,
+                            _rotation=rotation,
+                        )
+                        candidates.append(r)
+                    except Exception:
+                        pass
+
+            def _motion_cost(candidate: dict) -> float:
+                c_midi = sorted(candidate["midi"])
+                p_midi = sorted(prev_midis)
+                n = min(len(c_midi), len(p_midi))
+                return sum(abs(c_midi[j] - p_midi[j]) for j in range(n))
+
+            result = min(candidates, key=_motion_cost) if candidates else voice_chord(
+                root, quality, melody_note=mel, style=style
+            )
+
+        prev_midis = result["midi"]
+        voicings.append({
+            "symbol": symbol,
+            "beats": beats,
+            "notes": result["notes"],
+            "midi": result["midi"],
+            "abc": result["abc"],
+        })
+
+    # Build ABC line: chord token + duration
+    abc_parts = []
+    for v in voicings:
+        dur_beats = v["beats"]
+        # Duration as ABC multiplier (L:1/4 convention)
+        from fractions import Fraction
+        frac = Fraction(dur_beats).limit_denominator(64)
+        num, den = frac.numerator, frac.denominator
+        if den == 1:
+            dur_str = '' if num == 1 else str(num)
+        elif num == 1:
+            dur_str = f'/{den}'
+        else:
+            dur_str = f'{num}/{den}'
+        abc_parts.append(f"{v['abc']}{dur_str}")
+
+    return {
+        "voicings": voicings,
+        "abc_line": " ".join(abc_parts),
+    }
+
+
+def _parse_chord_symbol_to_root_quality(symbol: str) -> tuple[str, str]:
+    """Parse a chord symbol like 'Cmaj7', 'F#m', 'Bbdom7' into (root, quality)."""
+    # Try longest root match first
+    for root_len in (2, 1):
+        candidate_root = symbol[:root_len]
+        # Normalize: capitalize first letter
+        if len(candidate_root) == 2:
+            candidate_root = candidate_root[0].upper() + candidate_root[1]
+        else:
+            candidate_root = candidate_root.upper()
+        if candidate_root in NOTE_NAMES:
+            quality_str = symbol[root_len:].strip() or "major"
+            quality = normalize_chord_quality(quality_str, root=candidate_root)
+            # If normalize returned a dyad-interval key (e.g. 'm7' as minor-7th
+            # interval), it's wrong in chord-symbol context. Fall back to music21.
+            dyad_keys = {k for k, v in CHORD_INTERVALS.items() if len(v) <= 2}
+            if quality in dyad_keys and quality_str:
+                try:
+                    cs = _parse_chord_symbol(f"{candidate_root}{quality_str}")
+                    kind = cs.chordKind
+                    canonical = _M21_KIND_TO_QUALITY.get(kind)
+                    if canonical:
+                        quality = canonical
+                except Exception:
+                    pass
+            return candidate_root, quality
+    # Fallback
+    return "C", "major"

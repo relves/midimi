@@ -1,7 +1,8 @@
-"""ABC notation parser/serializer (Phase 1 subset).
+"""ABC notation parser/serializer (Phase 1 subset, Phase 5 multi-voice).
 
 Supported subset:
   Headers: X: T: M: L: Q: K:
+  Voice declarations: V: (in body, before first [V:id] line)
   Notes: A-G/a-g with octave marks (' ,), accidentals (^ _ = ^^ __),
          duration multipliers (N, /N, N/N)
   Chords: [CEG] with duration multiplier
@@ -10,6 +11,7 @@ Supported subset:
   Barlines: | || [| |] (treated uniformly)
   Repeats: |: :| (expanded on parse — section played twice)
   Ties: - (extends note duration into the next note of same pitch)
+  Inline fields: [Q:...] → skip for now; [V:...] mid-line → error
 
 Rejects tokens outside this subset with a bar/token-precise error message.
 
@@ -17,6 +19,11 @@ Octave convention (standard ABC):
   Uppercase letter = base octave 3 (C = C3 = MIDI 48)
   Lowercase letter = base octave 4 (c = C4 = MIDI 60 = middle C)
   ' raises by one octave, , lowers by one octave
+
+Multi-voice (Phase 5):
+  V: declaration lines appear after K:, before first [V:id] body line.
+  Body lines begin with [V:<id>] and contain whole bars for that voice.
+  A tune with no V: lines parses exactly as before (single-voice backward compat).
 """
 
 import re
@@ -73,22 +80,16 @@ _KEY_SIGS = _build_key_sigs()
 def _parse_key(k_value: str) -> dict[str, int]:
     """Parse K: header value and return accidental map {letter: +1/-1}."""
     k = k_value.strip()
-    # Normalize: 'Hp'/'HP' = highland pipes, treat as D (mixolydian) – rare, ignore
-    # Remove mode suffixes that don't affect our key sig lookup
-    # Try direct lookup first
     if k in _KEY_SIGS:
         return _KEY_SIGS[k]
-    # Try normalizing whitespace in things like "D maj"
     normalized = k.replace(' ', '')
     if normalized in _KEY_SIGS:
         return _KEY_SIGS[normalized]
-    # Common modes: treat as major (dor, phr, lyd, mix, aeo, loc, exp)
     for suffix in ('dor', 'phr', 'lyd', 'mix', 'aeo', 'loc', 'exp', 'ion'):
         if normalized.endswith(suffix):
             root = normalized[:-len(suffix)]
             if root in _KEY_SIGS:
                 return _KEY_SIGS[root]
-    # No match → default to C
     return {}
 
 
@@ -165,16 +166,12 @@ def _parse_tempo(q_value: str) -> float:
             bpm = float(bpm_part.strip())
         except ValueError:
             raise ABCParseError(f"Cannot parse tempo {q_value!r}")
-        # note_part could be '1/4', '3/8', etc. – this specifies the beat unit
-        # We want tempo in quarter-note BPM; convert if needed
         try:
             if '/' in note_part:
                 n, d = note_part.strip().split('/')
                 beat_fraction = Fraction(int(n), int(d))
             else:
                 beat_fraction = Fraction(int(note_part.strip()))
-            # bpm is given in these note values per minute
-            # Convert to quarter-note BPM: quarter = 1/4 note
             quarter_bpm = float(bpm * beat_fraction * 4)
         except (ValueError, ZeroDivisionError):
             quarter_bpm = bpm
@@ -223,9 +220,7 @@ _SECOND_ENDING_RE = re.compile(r'\[2')
 
 def _parse_duration(num_s: str | None, slash: str | None, den_s: str | None, unit: Fraction) -> Fraction:
     """Compute note duration in quarter-note beats given ABC duration tokens."""
-    # Numerator
     num = int(num_s) if num_s else 1
-    # Denominator
     if slash is None:
         den = 1
     elif den_s:
@@ -233,8 +228,6 @@ def _parse_duration(num_s: str | None, slash: str | None, den_s: str | None, uni
     else:
         den = 2  # bare '/' means halve
     duration_units = Fraction(num, den)
-    # duration in beats (quarter notes): unit is fraction of a whole note, quarter = 1/4
-    # unit in beats = unit * 4
     return duration_units * unit * 4
 
 
@@ -249,7 +242,6 @@ def _note_midi_and_name(
     upper = letter.upper()
     is_lower = letter.islower()
 
-    # Base octave
     octave = _BASE_OCTAVE['lower'] if is_lower else _BASE_OCTAVE['upper']
     for ch in octave_str:
         if ch == "'":
@@ -257,7 +249,6 @@ def _note_midi_and_name(
         elif ch == ',':
             octave -= 1
 
-    # Accidental offset
     if acc_str:
         if acc_str == '^':
             acc_offset = 1
@@ -271,10 +262,8 @@ def _note_midi_and_name(
             acc_offset = 0
         else:
             acc_offset = 0
-        # Apply to bar_accidentals so it persists until barline
         bar_accidentals[upper] = acc_offset
     else:
-        # Check bar accidentals first (they take priority over key sig)
         if upper in bar_accidentals:
             acc_offset = bar_accidentals[upper]
         else:
@@ -283,7 +272,6 @@ def _note_midi_and_name(
     pc = _LETTER_PC[upper]
     midi = 12 * (octave + 1) + pc + acc_offset
 
-    # Build note name string
     if acc_offset == 1:
         acc_name = '#'
     elif acc_offset == 2:
@@ -305,7 +293,8 @@ def _tokenize_body(body: str) -> list[tuple[str, str]]:
     """Tokenize ABC body into (type, raw) pairs.
 
     Types: 'note', 'rest', 'chord', 'barline', 'start_repeat', 'end_repeat',
-           'first_ending', 'second_ending', 'chord_symbol', 'tie', 'unknown'
+           'first_ending', 'second_ending', 'chord_symbol', 'tie',
+           'inline_field', 'unknown'
     """
     tokens = []
     pos = 0
@@ -363,6 +352,15 @@ def _tokenize_body(body: str) -> list[tuple[str, str]]:
             pos += 2
             continue
 
+        # Inline field [X:...] — must check before chord branch
+        # A chord is [note-letters]; an inline field is [letter:...]
+        if ch == '[' and pos + 2 < len(s) and s[pos+1].isalpha() and s[pos+2] == ':':
+            end = s.find(']', pos + 1)
+            if end != -1:
+                tokens.append(('inline_field', s[pos:end+1]))
+                pos = end + 1
+                continue
+
         # Chord [CEG...]
         if ch == '[':
             end = s.find(']', pos + 1)
@@ -417,14 +415,26 @@ def _tokenize_body(body: str) -> list[tuple[str, str]]:
             pos += 1
             continue
 
-        # Skip decorations +...+ or !...!
-        if ch in '+!':
-            end = s.find(ch, pos + 1)
+        # Decorations !...! — captured; unknown names are an error at parse time
+        if ch == '!':
+            end = s.find('!', pos + 1)
+            if end != -1:
+                tokens.append(('decoration', s[pos:end+1]))
+                pos = end + 1
+            else:
+                pos += 1
+            continue
+
+        # +...+ decorations (old style) — skip silently
+        if ch == '+':
+            end = s.find('+', pos + 1)
             pos = end + 1 if end != -1 else len(s)
             continue
 
-        # Skip staccato dots and other single-char ornaments
-        if ch in '.~HLMOPSTuv':
+        # Single-char shorthand decorations: H=fermata, L=accent, .=staccato
+        # M O P S T u v ~ = other ornaments, skip
+        if ch in '.HLMOPSTuv~':
+            tokens.append(('shorthand_decoration', ch))
             pos += 1
             continue
 
@@ -434,59 +444,99 @@ def _tokenize_body(body: str) -> list[tuple[str, str]]:
     return tokens
 
 
-# ── Main parser ───────────────────────────────────────────────────────────────
+# ── Repeat expansion ──────────────────────────────────────────────────────────
 
-def parse_abc(text: str) -> dict:
-    """Parse ABC notation text and return a normalized sequence dict.
+def _expand_repeats(tokens: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Expand |: ... :| repeats by duplicating the section."""
+    result = []
+    i = 0
+    while i < len(tokens):
+        tok_type, tok_raw = tokens[i]
+        if tok_type == 'start_repeat':
+            result.append(tokens[i])
+            i += 1
+            depth = 1
+            section_tokens = []
+            first_ending_tokens: list[tuple[str, str]] = []
+            second_ending_tokens: list[tuple[str, str]] = []
+            in_first = False
+            in_second = False
+            while i < len(tokens):
+                t, r = tokens[i]
+                if t == 'start_repeat':
+                    depth += 1
+                    section_tokens.append(tokens[i])
+                elif t == 'end_repeat':
+                    depth -= 1
+                    if depth == 0:
+                        if first_ending_tokens or second_ending_tokens:
+                            result.extend(section_tokens)
+                            result.extend(first_ending_tokens)
+                            result.append(('barline', '|'))
+                            result.extend(section_tokens)
+                            result.extend(second_ending_tokens)
+                        else:
+                            result.extend(section_tokens)
+                            result.append(('barline', '|'))
+                            result.extend(section_tokens)
+                        i += 1
+                        break
+                    else:
+                        section_tokens.append(tokens[i])
+                elif t == 'first_ending':
+                    in_first = True
+                    in_second = False
+                elif t == 'second_ending':
+                    in_second = True
+                    in_first = False
+                else:
+                    if in_first:
+                        first_ending_tokens.append(tokens[i])
+                    elif in_second:
+                        second_ending_tokens.append(tokens[i])
+                    else:
+                        section_tokens.append(tokens[i])
+                i += 1
+        else:
+            result.append(tokens[i])
+            i += 1
+    return result
 
-    Returns the same structure as build_sequence():
-      title, tempo_bpm, time_signature, time_signature_parts,
-      events (with notes, note_names, at_beat, duration_beats, velocity, label, root, quality, octave),
-      duration_ms, total_beats, key
 
-    Raises ABCParseError with bar-precise messages on invalid input.
+# ── Body parser (single-voice, extracted for reuse) ───────────────────────────
+
+def _parse_body_to_events(
+    body: str,
+    unit_length: Fraction,
+    key_sig: dict[str, int],
+    beats_per_bar: Fraction,
+    time_signature: str,
+) -> tuple[list[dict], list[str]]:
+    """Parse a single-voice ABC body string → (events, errors).
+
+    This is the core event-builder, extracted so multi-voice parse can call it
+    per-voice.  All existing logic is preserved exactly.
     """
-    lines = text.splitlines()
-    headers, body_start = _parse_headers(lines)
-    body = '\n'.join(lines[body_start:])
-
-    # Parse headers
-    title = headers.get('T', 'Untitled').strip()
-
-    ts_num, ts_den = _parse_meter(headers['M']) if 'M' in headers else (4, 4)
-    time_signature = f"{ts_num}/{ts_den}"
-    beats_per_bar = Fraction(ts_num * 4, ts_den)  # in quarter-note beats
-
-    unit_length = _parse_unit_length(headers['L']) if 'L' in headers else _default_unit_length(ts_num, ts_den)
-
-    tempo_bpm = _parse_tempo(headers['Q']) if 'Q' in headers else 96.0
-
-    key_sig = _parse_key(headers.get('K', 'C'))
-    key_name = headers.get('K', 'C').strip()
-
-    # Tokenize body
     tokens = _tokenize_body(body)
-
-    # Expand repeats: find |: ... :| sections and duplicate
     tokens = _expand_repeats(tokens)
 
-    # Process tokens into events
     events: list[dict] = []
     errors: list[str] = []
 
     bar_num = 1
     beat_in_bar = Fraction(0)
     at_beat = Fraction(0)
-    bar_accidentals: dict[str, int] = {}  # reset at each barline
-    tie_pending: dict[int, int] = {}  # midi_note -> event index; only active when tie_active
-    tie_active: bool = False  # True only immediately after a '-' token
+    bar_accidentals: dict[str, int] = {}
+    tie_pending: dict[int, int] = {}
+    tie_active: bool = False
+    pending_decs: list[str] = []  # decorations accumulated before next note
+    running_velocity: int = 90
 
     def _reset_bar():
-        nonlocal bar_num, beat_in_bar, bar_accidentals, tie_pending, tie_active
+        nonlocal bar_num, beat_in_bar, bar_accidentals
         bar_num += 1
         beat_in_bar = Fraction(0)
         bar_accidentals = {}
-        # ties can span barlines in ABC, so keep tie_pending/tie_active
 
     for tok_type, tok_raw in tokens:
         if tok_type in ('barline', 'first_ending', 'second_ending'):
@@ -510,8 +560,39 @@ def parse_abc(text: str) -> dict:
         if tok_type in ('chord_symbol', 'unknown'):
             continue
 
+        if tok_type == 'inline_field':
+            # [Q:...] → tempo-change event; [V:...] mid-line → error
+            if tok_raw.startswith('[V:') or tok_raw.startswith('[v:'):
+                raise ABCParseError(
+                    f"Bar {bar_num}: inline [V:] mid-line voice switching is not supported; "
+                    "use stacked [V:id] lines at the start of each line instead."
+                )
+            if tok_raw.upper().startswith('[Q:'):
+                q_val = tok_raw[3:-1].strip()
+                try:
+                    new_tempo = _parse_tempo(q_val)
+                    events.append({
+                        'at_beat': float(at_beat),
+                        'duration_beats': 0.0,
+                        'notes': [],
+                        'note_names': [],
+                        'root': '',
+                        'quality': 'tempo_change',
+                        'octave': 0,
+                        'velocity': 0,
+                        'label': f'Q:{q_val}',
+                        'tempo_bpm': new_tempo,
+                    })
+                except ABCParseError:
+                    pass
+            continue
+
+        if tok_type in ('decoration', 'shorthand_decoration'):
+            # Accumulate pending decorations; applied to next note/chord
+            pending_decs.append(tok_raw)
+            continue
+
         if tok_type == 'tie':
-            # Record which events are tied; next note of same pitch extends them
             tie_active = True
             for note_midi, evt_idx in tie_pending.items():
                 if evt_idx < len(events):
@@ -543,7 +624,6 @@ def parse_abc(text: str) -> dict:
                 m.group('letter'), m.group('acc') or '', m.group('octave') or '',
                 key_sig, bar_accidentals,
             )
-            # Handle tie continuation: only extend if tie was explicitly marked
             if tie_active and midi in tie_pending:
                 prev_idx = tie_pending[midi]
                 if prev_idx < len(events):
@@ -557,7 +637,7 @@ def parse_abc(text: str) -> dict:
             evt_idx = len(events)
             tie_pending = {midi: evt_idx}
             octave = midi // 12 - 1
-            events.append({
+            evt = {
                 'at_beat': float(at_beat),
                 'duration_beats': float(dur),
                 'notes': [midi],
@@ -565,15 +645,18 @@ def parse_abc(text: str) -> dict:
                 'root': note_name[:-1] if note_name[-1].isdigit() else note_name,
                 'quality': 'note',
                 'octave': octave,
-                'velocity': 90,
+                'velocity': running_velocity,
                 'label': note_name,
-            })
+            }
+            if pending_decs:
+                running_velocity, _ = _apply_decorations(evt, pending_decs, running_velocity, bar_num, errors)
+                pending_decs = []
+            events.append(evt)
             at_beat += dur
             beat_in_bar += dur
             continue
 
         if tok_type == 'chord':
-            # Parse [notes]dur
             inner_m = re.match(r'\[([^\]]+)\]((\d+)?(/)?(\d+)?)', tok_raw)
             if not inner_m:
                 inner_m = re.match(r'\[([^\]]+)\]', tok_raw)
@@ -584,7 +667,6 @@ def parse_abc(text: str) -> dict:
                 raise ABCParseError(f"Bar {bar_num}: cannot parse chord token {tok_raw!r}")
 
             inner = inner_m.group(1)
-            # Parse duration from after ]
             if dur_raw:
                 dur_m = re.match(r'(\d+)?(/)?(\d+)?', dur_raw)
                 dur = _parse_duration(
@@ -594,12 +676,11 @@ def parse_abc(text: str) -> dict:
                     unit_length,
                 )
             else:
-                dur = unit_length * 4  # 1 unit note
+                dur = unit_length * 4
 
-            # Parse each note inside the chord
             chord_midis = []
             chord_names = []
-            chord_bar_acc = dict(bar_accidentals)  # chord notes share bar_accidentals
+            chord_bar_acc = dict(bar_accidentals)
             for nm in _NOTE_TOKEN_RE.finditer(inner):
                 midi, note_name = _note_midi_and_name(
                     nm.group('letter'), nm.group('acc') or '', nm.group('octave') or '',
@@ -610,11 +691,10 @@ def parse_abc(text: str) -> dict:
             if not chord_midis:
                 raise ABCParseError(f"Bar {bar_num}: empty chord {tok_raw!r}")
 
-            # Update bar_accidentals from chord
             bar_accidentals.update(chord_bar_acc)
 
             octave = chord_midis[0] // 12 - 1
-            events.append({
+            evt = {
                 'at_beat': float(at_beat),
                 'duration_beats': float(dur),
                 'notes': chord_midis,
@@ -622,9 +702,13 @@ def parse_abc(text: str) -> dict:
                 'root': chord_names[0][:-1] if chord_names[0][-1].isdigit() else chord_names[0],
                 'quality': 'note',
                 'octave': octave,
-                'velocity': 90,
+                'velocity': running_velocity,
                 'label': '+'.join(chord_names),
-            })
+            }
+            if pending_decs:
+                running_velocity, _ = _apply_decorations(evt, pending_decs, running_velocity, bar_num, errors)
+                pending_decs = []
+            events.append(evt)
             at_beat += dur
             beat_in_bar += dur
             tie_pending = {}
@@ -633,25 +717,274 @@ def parse_abc(text: str) -> dict:
 
     # Final bar check (if no trailing barline)
     if beat_in_bar > 0 and beat_in_bar != beats_per_bar:
-        # Allow the last bar to be a pickup (partial) bar without error
-        # But report if it's over-full
         if beat_in_bar > beats_per_bar + Fraction(1, 64):
             errors.append(
                 f"bar {bar_num} contains {float(beat_in_bar):.4g} beats; "
                 f"meter {time_signature} expects {float(beats_per_bar):.4g}"
             )
 
-    # Clean up internal fields
     for evt in events:
         evt.pop('_tied', None)
 
-    if errors:
-        raise ABCParseError('\n'.join(errors))
+    return events, errors
 
-    if not events:
+
+# ── Multi-voice helpers ───────────────────────────────────────────────────────
+
+_V_DECL_RE = re.compile(r'^V:(\S+)(.*)')
+_V_BODY_LINE_RE = re.compile(r'^\[V:([^\]]+)\](.*)')
+
+
+def _parse_voice_declarations(body_lines: list[str]) -> list[dict]:
+    """Parse V:id [name="..." octave=N] declaration lines from body region.
+
+    Stops at the first [V:id] body line.  Only name= and octave= are accepted;
+    other attributes are an error.
+    """
+    voices: list[dict] = []
+    seen_ids: set[str] = set()
+    for line in body_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith('%'):
+            continue
+        if stripped.startswith('[V:'):
+            break  # into voice bodies — stop scanning declarations
+        m = _V_DECL_RE.match(stripped)
+        if not m:
+            continue
+        vid = m.group(1).strip()
+        attrs_str = m.group(2).strip()
+        if vid in seen_ids:
+            continue
+        seen_ids.add(vid)
+        name = vid
+        octave_shift = 0
+        nm = re.search(r'name="([^"]*)"', attrs_str)
+        if nm:
+            name = nm.group(1)
+        om = re.search(r'octave=(-?\d+)', attrs_str)
+        if om:
+            octave_shift = int(om.group(1))
+        remainder = attrs_str
+        remainder = re.sub(r'name="[^"]*"', '', remainder)
+        remainder = re.sub(r'octave=-?\d+', '', remainder).strip()
+        if remainder:
+            raise ABCParseError(f"V:{vid}: unknown voice attributes: {remainder!r}")
+        voices.append({'id': vid, 'name': name, 'octave_shift': octave_shift})
+    return voices
+
+
+def _split_voice_bodies(body_lines: list[str]) -> dict[str, list[str]]:
+    """Split body lines into per-voice content based on [V:id] line prefixes.
+
+    Lines before the first [V:id] marker (V: declarations, etc.) are skipped.
+    Consecutive lines without a [V:id] prefix continue the current voice.
+    """
+    voice_bodies: dict[str, list[str]] = {}
+    current_voice: str | None = None
+    in_body = False
+
+    for line in body_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith('%'):
+            continue
+        m = _V_BODY_LINE_RE.match(stripped)
+        if m:
+            in_body = True
+            vid = m.group(1).strip()
+            rest = m.group(2).strip()
+            current_voice = vid
+            if vid not in voice_bodies:
+                voice_bodies[vid] = []
+            if rest:
+                voice_bodies[vid].append(rest)
+        elif not in_body:
+            # V: declarations or other pre-body content — skip
+            continue
+        elif current_voice is not None:
+            voice_bodies[current_voice].append(stripped)
+
+    return voice_bodies
+
+
+def _assign_channels(voices: list[dict]) -> None:
+    """Assign MIDI channels to voices in-place, skipping channel 9 (percussion)."""
+    ch = 0
+    for v in voices:
+        if ch == 9:
+            ch += 1
+        v['channel'] = ch
+        v.setdefault('program', 0)
+        ch += 1
+
+
+def _check_voice_interactions(events: list[dict], voices: list[dict]) -> list[str]:
+    """Return informational messages about voice crossing and unisons."""
+    if len(voices) < 2:
+        return []
+    warnings: list[str] = []
+    voice_order = [v['id'] for v in voices]
+    voice_name = {v['id']: v.get('name', v['id']) for v in voices}
+
+    # Group simultaneous events by beat
+    from collections import defaultdict
+    beat_notes: dict[float, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+    for e in events:
+        vid = e.get('voice', voice_order[0])
+        beat_notes[e['at_beat']][vid].extend(e['notes'])
+
+    seen_crossing: set[tuple[str, str]] = set()
+    seen_unison: dict[tuple[str, str], set[int]] = {}
+
+    for beat in sorted(beat_notes):
+        vn = beat_notes[beat]
+        for i, vid_hi in enumerate(voice_order):
+            for vid_lo in voice_order[i+1:]:
+                hi_notes = vn.get(vid_hi, [])
+                lo_notes = vn.get(vid_lo, [])
+                if not hi_notes or not lo_notes:
+                    continue
+                # Voice crossing: the lower-declared voice sounds above the higher-declared
+                if min(lo_notes) > max(hi_notes):
+                    key = (vid_hi, vid_lo)
+                    if key not in seen_crossing:
+                        seen_crossing.add(key)
+                        warnings.append(
+                            f"voice crossing at beat {beat:.4g}: "
+                            f"{voice_name[vid_lo]} above {voice_name[vid_hi]}"
+                        )
+                # Unison: same pitch in both voices
+                common = set(hi_notes) & set(lo_notes)
+                if common:
+                    key2 = (vid_hi, vid_lo)
+                    already = seen_unison.get(key2, set())
+                    new_common = common - already
+                    if new_common:
+                        seen_unison[key2] = already | new_common
+                        from sequencer.theory import midi_note_name
+                        note_strs = [midi_note_name(n) for n in sorted(new_common)]
+                        warnings.append(
+                            f"unison at beat {beat:.4g}: "
+                            f"{voice_name[vid_hi]} and {voice_name[vid_lo]} share "
+                            f"{', '.join(note_strs)}"
+                        )
+
+    return warnings
+
+
+# ── Main parser ───────────────────────────────────────────────────────────────
+
+def parse_abc(text: str) -> dict:
+    """Parse ABC notation text and return a normalized sequence dict.
+
+    Single-voice ABC (no V: declarations) returns the same structure as before.
+    Multi-voice ABC adds a 'voices' key and tags each event with 'voice'.
+
+    Raises ABCParseError with bar-precise messages on invalid input.
+    """
+    lines = text.splitlines()
+    headers, body_start = _parse_headers(lines)
+    body_lines = lines[body_start:]
+
+    # Parse headers
+    title = headers.get('T', 'Untitled').strip()
+
+    ts_num, ts_den = _parse_meter(headers['M']) if 'M' in headers else (4, 4)
+    time_signature = f"{ts_num}/{ts_den}"
+    beats_per_bar = Fraction(ts_num * 4, ts_den)
+
+    unit_length = _parse_unit_length(headers['L']) if 'L' in headers else _default_unit_length(ts_num, ts_den)
+
+    tempo_bpm = _parse_tempo(headers['Q']) if 'Q' in headers else 96.0
+
+    key_sig = _parse_key(headers.get('K', 'C'))
+    key_name = headers.get('K', 'C').strip()
+
+    # Detect multi-voice: any body line starts with [V:
+    is_multivoice = any(re.match(r'^\s*\[V:', l) for l in body_lines)
+
+    if not is_multivoice:
+        # ── Single-voice path (unchanged) ────────────────────────────────────
+        body = '\n'.join(body_lines)
+        events, errors = _parse_body_to_events(body, unit_length, key_sig, beats_per_bar, time_signature)
+
+        if errors:
+            raise ABCParseError('\n'.join(errors))
+        if not events:
+            raise ABCParseError("No notes found in ABC")
+
+        total_beats = max(e['at_beat'] + e['duration_beats'] for e in events)
+        duration_ms = int(total_beats * 60 / tempo_bpm * 1000)
+
+        return {
+            'title': title,
+            'tempo_bpm': float(tempo_bpm),
+            'time_signature': time_signature,
+            'time_signature_parts': (ts_num, ts_den),
+            'events': events,
+            'duration_ms': duration_ms,
+            'total_beats': total_beats,
+            'key': key_name,
+            'abc_errors': [],
+        }
+
+    # ── Multi-voice path ──────────────────────────────────────────────────────
+    voice_decls = _parse_voice_declarations(body_lines)
+    voice_bodies = _split_voice_bodies(body_lines)
+
+    # If no explicit V: declarations, infer from body markers
+    if not voice_decls:
+        for vid in voice_bodies:
+            voice_decls.append({'id': vid, 'name': vid, 'octave_shift': 0})
+
+    _assign_channels(voice_decls)
+
+    all_events: list[dict] = []
+    all_errors: list[str] = []
+    voice_beat_totals: dict[str, float] = {}
+
+    for v in voice_decls:
+        vid = v['id']
+        vname = v.get('name', vid)
+        vbody = '\n'.join(voice_bodies.get(vid, []))
+        evts, errs = _parse_body_to_events(vbody, unit_length, key_sig, beats_per_bar, time_signature)
+
+        # Apply octave shift (from octave= attribute)
+        if v.get('octave_shift', 0):
+            shift = v['octave_shift'] * 12
+            for e in evts:
+                e['notes'] = [n + shift for n in e['notes']]
+
+        for e in evts:
+            e['voice'] = vid
+        all_events.extend(evts)
+        all_errors.extend([f"voice {vname}, {err}" for err in errs])
+        voice_beat_totals[vid] = max(
+            (e['at_beat'] + e['duration_beats'] for e in evts), default=0.0
+        )
+
+    # Voice bar count mismatch → error
+    if len(voice_beat_totals) > 1:
+        bpb = float(beats_per_bar)
+        voice_bars = {
+            vid: round(beats / bpb) for vid, beats in voice_beat_totals.items()
+        }
+        # Use voice names in error message
+        vid_to_name = {v['id']: v.get('name', v['id']) for v in voice_decls}
+        if len(set(voice_bars.values())) > 1:
+            parts = [f"voice {vid_to_name[vid]} has {n} bars" for vid, n in voice_bars.items()]
+            all_errors.append('; '.join(parts))
+
+    if all_errors:
+        raise ABCParseError('\n'.join(all_errors))
+
+    # Informational: voice crossing, unisons (non-fatal)
+    warnings = _check_voice_interactions(all_events, voice_decls)
+
+    if not all_events:
         raise ABCParseError("No notes found in ABC")
 
-    total_beats = max(e['at_beat'] + e['duration_beats'] for e in events)
+    total_beats = max(e['at_beat'] + e['duration_beats'] for e in all_events)
     duration_ms = int(total_beats * 60 / tempo_bpm * 1000)
 
     return {
@@ -659,12 +992,92 @@ def parse_abc(text: str) -> dict:
         'tempo_bpm': float(tempo_bpm),
         'time_signature': time_signature,
         'time_signature_parts': (ts_num, ts_den),
-        'events': events,
+        'events': sorted(all_events, key=lambda e: (e['at_beat'], e.get('voice', '1'))),
         'duration_ms': duration_ms,
         'total_beats': total_beats,
         'key': key_name,
-        'abc_errors': [],  # populated only on warnings (not errors)
+        'voices': voice_decls,
+        'abc_errors': warnings,
     }
+
+
+# ── Decoration / articulation helpers ────────────────────────────────────────
+
+# Known !decoration! names and shorthand mappings
+_KNOWN_DECORATIONS: dict[str, str] = {
+    '!fermata!': 'fermata', '!fermata2!': 'fermata',
+    '!trill!': 'skip',     '!mordent!': 'skip',   '!turn!': 'skip',
+    '!tenuto!': 'tenuto',
+    '!accent!': 'accent',   '!emphasis!': 'accent',
+    '!staccato!': 'staccato',
+    '!p!': 'dynamic_p', '!pp!': 'dynamic_pp', '!ppp!': 'dynamic_ppp',
+    '!mp!': 'dynamic_mp', '!mf!': 'dynamic_mf',
+    '!f!': 'dynamic_f', '!ff!': 'dynamic_ff', '!fff!': 'dynamic_fff',
+    '!sfz!': 'dynamic_sfz', '!sf!': 'dynamic_sfz',
+    '!crescendo(!': 'skip', '!crescendo)!': 'skip',
+    '!diminuendo(!': 'skip', '!diminuendo)!': 'skip',
+    '!<(!': 'skip', '!<)!': 'skip', '!>(!': 'skip', '!>)!': 'skip',
+    '!D.C.!': 'skip', '!D.S.!': 'skip', '!segno!': 'skip', '!coda!': 'skip',
+    '!fine!': 'skip', '!>!': 'skip', '!<<!': 'skip', '!>>!': 'skip',
+    '!8va!': 'skip', '!8vb!': 'skip',
+    '!trem1!': 'skip', '!trem2!': 'skip', '!trem3!': 'skip', '!trem4!': 'skip',
+}
+
+_SHORTHAND_MAP: dict[str, str] = {
+    'H': 'fermata',   # fermata shorthand
+    'L': 'accent',    # accent shorthand
+    '.': 'staccato',  # staccato shorthand
+}
+
+_DYNAMIC_VELOCITY: dict[str, int] = {
+    'dynamic_ppp': 32, 'dynamic_pp': 40, 'dynamic_p': 48,
+    'dynamic_mp': 64, 'dynamic_mf': 80,
+    'dynamic_f': 96, 'dynamic_ff': 108, 'dynamic_fff': 120,
+    'dynamic_sfz': 112,
+}
+
+FERMATA_FACTOR_DEFAULT = 1.8
+
+
+def _apply_decorations(
+    event: dict,
+    decorations: list[str],
+    running_velocity: int,
+    bar_num: int,
+    errors: list[str],
+) -> tuple[int, list[str]]:
+    """Apply decoration list to event in-place.  Returns (new running_velocity, remaining_unknown).
+
+    Unknown !...! decorations are added to errors list.
+    """
+    for dec in decorations:
+        # Shorthand (single char)
+        if len(dec) == 1:
+            kind = _SHORTHAND_MAP.get(dec)
+        else:
+            kind = _KNOWN_DECORATIONS.get(dec.lower())
+            if kind is None:
+                # Unknown !...! → error per plan
+                errors.append(f"bar {bar_num}: unknown decoration {dec!r}")
+                continue
+
+        if kind == 'skip' or kind is None:
+            continue
+        elif kind == 'fermata':
+            event['fermata'] = True
+        elif kind == 'staccato':
+            event['staccato'] = True
+        elif kind == 'tenuto':
+            event['tenuto'] = True
+        elif kind == 'accent':
+            event['accent'] = True
+        elif kind.startswith('dynamic_'):
+            vel = _DYNAMIC_VELOCITY.get(kind, running_velocity)
+            event['dynamic'] = kind
+            event['velocity'] = vel
+            running_velocity = vel
+
+    return running_velocity, []
 
 
 def _check_bar(bar_num: int, beat_in_bar: Fraction, beats_per_bar: Fraction, errors: list[str], ts: str = "") -> None:
@@ -675,69 +1088,6 @@ def _check_bar(bar_num: int, beat_in_bar: Fraction, beats_per_bar: Fraction, err
             f"bar {bar_num} contains {float(beat_in_bar):.4g} beats; "
             f"{meter_str} {float(beats_per_bar):.4g}"
         )
-
-
-def _expand_repeats(tokens: list[tuple[str, str]]) -> list[tuple[str, str]]:
-    """Expand |: ... :| repeats by duplicating the section."""
-    result = []
-    i = 0
-    while i < len(tokens):
-        tok_type, tok_raw = tokens[i]
-        if tok_type == 'start_repeat':
-            # Find matching end_repeat, handling nested (simplified: find first :|)
-            result.append(tokens[i])
-            section_start = i + 1
-            i += 1
-            depth = 1
-            section_tokens = []
-            first_ending_tokens: list[tuple[str, str]] = []
-            second_ending_tokens: list[tuple[str, str]] = []
-            in_first = False
-            in_second = False
-            while i < len(tokens):
-                t, r = tokens[i]
-                if t == 'start_repeat':
-                    depth += 1
-                    section_tokens.append(tokens[i])
-                elif t == 'end_repeat':
-                    depth -= 1
-                    if depth == 0:
-                        # Emit section once with first ending, once without first ending but with second
-                        if first_ending_tokens or second_ending_tokens:
-                            # First pass: main + first ending
-                            result.extend(section_tokens)
-                            result.extend(first_ending_tokens)
-                            result.append(('barline', '|'))
-                            # Second pass: main + second ending
-                            result.extend(section_tokens)
-                            result.extend(second_ending_tokens)
-                        else:
-                            # Simple repeat: play section twice
-                            result.extend(section_tokens)
-                            result.append(('barline', '|'))
-                            result.extend(section_tokens)
-                        i += 1
-                        break
-                    else:
-                        section_tokens.append(tokens[i])
-                elif t == 'first_ending':
-                    in_first = True
-                    in_second = False
-                elif t == 'second_ending':
-                    in_second = True
-                    in_first = False
-                else:
-                    if in_first:
-                        first_ending_tokens.append(tokens[i])
-                    elif in_second:
-                        second_ending_tokens.append(tokens[i])
-                    else:
-                        section_tokens.append(tokens[i])
-                i += 1
-        else:
-            result.append(tokens[i])
-            i += 1
-    return result
 
 
 # ── Serializer ────────────────────────────────────────────────────────────────
@@ -754,7 +1104,6 @@ def _midi_to_abc_note(midi: int, note_name: str | None = None) -> str:
     Returns just the letter+accidental+octave part (no duration).
     """
     if note_name:
-        # Parse the note name: letter + acc + octave
         m = re.match(r'^([A-G])(#{1,2}|b{1,2}|bb?)?(-?\d+)$', note_name)
         if m:
             letter = m.group(1)
@@ -772,14 +1121,8 @@ def _midi_to_abc_note(midi: int, note_name: str | None = None) -> str:
         letter = name[0]
         acc = name[1:] if len(name) > 1 else ''
 
-    # Accidental in ABC notation
     abc_acc = acc.replace('#', '^').replace('b', '_')
 
-    # Octave in ABC notation
-    # octave 3 → uppercase, no marks
-    # octave 4 → lowercase, no marks
-    # octave 5 → lowercase + '
-    # octave 2 → uppercase + ,
     if octave == 3:
         abc_letter = letter.upper()
         oct_marks = ''
@@ -803,7 +1146,6 @@ def _duration_to_abc(duration_beats: float, unit_beats: float = 1.0) -> str:
     half note = '2', eighth note = '/2', dotted quarter = '3/2', etc.
     """
     frac = Fraction(duration_beats).limit_denominator(64) / Fraction(unit_beats).limit_denominator(64)
-    # Simplify
     num = frac.numerator
     den = frac.denominator
     if den == 1:
@@ -813,12 +1155,82 @@ def _duration_to_abc(duration_beats: float, unit_beats: float = 1.0) -> str:
     return f'{num}/{den}'
 
 
+def _event_prefix(e: dict) -> str:
+    """Build the decoration prefix string for an event (for serialization)."""
+    parts = []
+    if e.get('dynamic'):
+        # dynamic_mp → !mp!
+        dyn = e['dynamic'].replace('dynamic_', '!')
+        parts.append(dyn + '!')
+    if e.get('fermata'):
+        parts.append('!fermata!')
+    if e.get('staccato'):
+        parts.append('.')
+    if e.get('tenuto'):
+        parts.append('!tenuto!')
+    if e.get('accent'):
+        parts.append('!accent!')
+    return ''.join(parts)
+
+
+def _render_bar_events(bar_evts: list[dict], bar_start: float, bar_end: float) -> str:
+    """Render a list of events within a bar to an ABC token string."""
+    bar_tokens: list[str] = []
+    prev_end = bar_start
+    for e in bar_evts:
+        if e.get('quality') == 'tempo_change':
+            # Inline [Q:...] tempo change event
+            bpm = e.get('tempo_bpm', 120)
+            bar_tokens.append(f"[Q:{int(round(bpm))}]")
+            continue
+        gap = e['at_beat'] - prev_end
+        if gap > 1e-6:
+            bar_tokens.append(f"z{_duration_to_abc(gap)}")
+        prefix = _event_prefix(e)
+        if not e.get('notes'):
+            prev_end = e['at_beat'] + e.get('duration_beats', 0)
+            continue
+        # Clamp duration to bar boundary to prevent overfull bars
+        capped_dur = min(e['duration_beats'], bar_end - e['at_beat'])
+        if capped_dur <= 0:
+            continue
+        if len(e['notes']) == 1:
+            note_names = e.get('note_names') or []
+            nn = note_names[0] if note_names else None
+            abc_note = _midi_to_abc_note(e['notes'][0], nn)
+            dur = _duration_to_abc(capped_dur)
+            bar_tokens.append(f"{prefix}{abc_note}{dur}")
+        elif len(e['notes']) > 1:
+            note_names = e.get('note_names') or []
+            chord_parts = []
+            for i, midi in enumerate(e['notes']):
+                nn = note_names[i] if i < len(note_names) else None
+                chord_parts.append(_midi_to_abc_note(midi, nn))
+            dur = _duration_to_abc(capped_dur)
+            bar_tokens.append(f"{prefix}[{''.join(chord_parts)}]{dur}")
+        prev_end = e['at_beat'] + e['duration_beats']
+
+    trailing = bar_end - prev_end
+    if trailing > 1e-6:
+        bar_tokens.append(f"z{_duration_to_abc(trailing)}")
+
+    return ' '.join(bar_tokens) if bar_tokens else 'z'
+
+
 def to_abc(sequence: dict) -> str:
     """Serialize a sequence dict back to ABC notation.
 
-    Uses L:1/4 (unit note = quarter), one bar per |, 4 bars per line.
-    Produces deterministic output suitable for round-trip testing.
+    Single-voice: uses L:1/4, one bar per |, 4 bars per line (unchanged).
+    Multi-voice: emits V: declarations + interleaved [V:id] 4-bar systems.
     """
+    voices = sequence.get('voices')
+    if voices and len(voices) > 1:
+        return _to_abc_multi(sequence)
+    return _to_abc_single(sequence)
+
+
+def _to_abc_single(sequence: dict) -> str:
+    """Single-voice serializer — unchanged from Phase 1."""
     title = sequence.get('title', 'Untitled')
     tempo = sequence.get('tempo_bpm', 96.0)
     ts = sequence.get('time_signature', '4/4')
@@ -827,7 +1239,6 @@ def to_abc(sequence: dict) -> str:
     ts_num, ts_den = map(int, ts.split('/'))
     beats_per_bar = ts_num * 4 / ts_den
 
-    # Headers (L:1/4 so unit = 1 quarter beat)
     lines = [
         f"X:1",
         f"T:{title}",
@@ -845,55 +1256,18 @@ def to_abc(sequence: dict) -> str:
     total_beats = sequence.get('total_beats', 0.0)
     n_bars = int(total_beats / beats_per_bar) + (1 if total_beats % beats_per_bar > 1e-6 else 0)
 
-    # Build a timeline: for each fractional beat, what's playing?
-    # Group events by bar
     bar_lines: list[str] = []
-
-    # Process bar by bar
-    beat = 0.0
-    evt_idx = 0
     all_events = list(events)
 
     for bar_i in range(max(n_bars, 1)):
         bar_start = bar_i * beats_per_bar
         bar_end = bar_start + beats_per_bar
-        bar_evts = []
-        for e in all_events:
-            if e['at_beat'] >= bar_start - 1e-6 and e['at_beat'] < bar_end - 1e-6:
-                bar_evts.append(e)
+        bar_evts = [
+            e for e in all_events
+            if e['at_beat'] >= bar_start - 1e-6 and e['at_beat'] < bar_end - 1e-6
+        ]
+        bar_lines.append(_render_bar_events(bar_evts, bar_start, bar_end))
 
-        bar_tokens = []
-        prev_end = bar_start
-        for e in bar_evts:
-            # Gap = rest
-            gap = e['at_beat'] - prev_end
-            if gap > 1e-6:
-                bar_tokens.append(f"z{_duration_to_abc(gap)}")
-            # Event notes
-            if len(e['notes']) == 1:
-                note_names = e.get('note_names') or []
-                nn = note_names[0] if note_names else None
-                abc_note = _midi_to_abc_note(e['notes'][0], nn)
-                dur = _duration_to_abc(e['duration_beats'])
-                bar_tokens.append(f"{abc_note}{dur}")
-            elif len(e['notes']) > 1:
-                note_names = e.get('note_names') or []
-                chord_parts = []
-                for i, midi in enumerate(e['notes']):
-                    nn = note_names[i] if i < len(note_names) else None
-                    chord_parts.append(_midi_to_abc_note(midi, nn))
-                dur = _duration_to_abc(e['duration_beats'])
-                bar_tokens.append(f"[{''.join(chord_parts)}]{dur}")
-            prev_end = e['at_beat'] + e['duration_beats']
-
-        # Trailing rest to fill bar
-        trailing = bar_end - prev_end
-        if trailing > 1e-6:
-            bar_tokens.append(f"z{_duration_to_abc(trailing)}")
-
-        bar_lines.append(' '.join(bar_tokens) if bar_tokens else 'z')
-
-    # Format: 4 bars per line, separated by |, final |
     body_lines = []
     for i in range(0, len(bar_lines), 4):
         chunk = bar_lines[i:i + 4]
@@ -903,22 +1277,107 @@ def to_abc(sequence: dict) -> str:
     return '\n'.join(lines)
 
 
+def _to_abc_multi(sequence: dict) -> str:
+    """Multi-voice serializer: V: declarations + interleaved [V:id] 4-bar systems."""
+    title = sequence.get('title', 'Untitled')
+    tempo = sequence.get('tempo_bpm', 96.0)
+    ts = sequence.get('time_signature', '4/4')
+    key = sequence.get('key', 'C')
+    voices = sequence['voices']
+
+    ts_num, ts_den = map(int, ts.split('/'))
+    beats_per_bar = ts_num * 4 / ts_den
+
+    lines = [
+        "X:1",
+        f"T:{title}",
+        f"M:{ts}",
+        f"L:1/4",
+        f"Q:{int(round(tempo))}",
+        f"K:{key}",
+    ]
+
+    # Voice declaration lines
+    for v in voices:
+        vline = f"V:{v['id']}"
+        if v.get('name') and v['name'] != v['id']:
+            vline += f' name="{v["name"]}"'
+        if v.get('octave_shift', 0):
+            vline += f' octave={v["octave_shift"]}'
+        lines.append(vline)
+
+    # Group events by voice
+    events_by_voice: dict[str, list[dict]] = {v['id']: [] for v in voices}
+    for e in sequence.get('events', []):
+        vid = e.get('voice', voices[0]['id'])
+        if vid in events_by_voice:
+            events_by_voice[vid].append(e)
+    for vid in events_by_voice:
+        events_by_voice[vid].sort(key=lambda e: e['at_beat'])
+
+    total_beats = sequence.get('total_beats', 0.0)
+    n_bars = int(total_beats / beats_per_bar) + (1 if total_beats % beats_per_bar > 1e-6 else 0)
+
+    # Build bar-strings per voice
+    voice_bar_lines: dict[str, list[str]] = {}
+    for v in voices:
+        vid = v['id']
+        vevents = events_by_voice[vid]
+        vbars: list[str] = []
+        for bar_i in range(max(n_bars, 1)):
+            bar_start = bar_i * beats_per_bar
+            bar_end = bar_start + beats_per_bar
+            bar_evts = [
+                e for e in vevents
+                if e['at_beat'] >= bar_start - 1e-6 and e['at_beat'] < bar_end - 1e-6
+            ]
+            vbars.append(_render_bar_events(bar_evts, bar_start, bar_end))
+        voice_bar_lines[vid] = vbars
+
+    # Interleave voices in 4-bar systems
+    for chunk_start in range(0, n_bars, 4):
+        chunk_end = min(chunk_start + 4, n_bars)
+        for v in voices:
+            vid = v['id']
+            chunk = voice_bar_lines[vid][chunk_start:chunk_end]
+            body = ' | '.join(chunk) + ' |'
+            lines.append(f"[V:{vid}] {body}")
+
+    return '\n'.join(lines)
+
+
 # ── Per-bar validation ────────────────────────────────────────────────────────
 
 def per_bar_report(sequence: dict) -> list[str]:
     """Return per-bar beat accounting messages for a sequence dict.
 
+    Multi-voice sequences prefix each message with 'voice <name>, '.
     Returns list of error strings (empty = all bars correct).
-    The sequence must have time_signature_parts and events with at_beat/duration_beats.
     """
+    voices = sequence.get('voices')
+    if not voices:
+        return _per_bar_report_single(sequence, sequence.get('events', []))
+
+    messages: list[str] = []
+    for v in voices:
+        vid = v['id']
+        vname = v.get('name', vid)
+        vevents = [e for e in sequence.get('events', []) if e.get('voice') == vid]
+        voice_msgs = _per_bar_report_single(sequence, vevents)
+        messages.extend([f"voice {vname}, {m}" for m in voice_msgs])
+    return messages
+
+
+def _per_bar_report_single(sequence: dict, events: list[dict]) -> list[str]:
+    """Per-bar beat accounting for a single set of events."""
     ts_num, ts_den = sequence['time_signature_parts']
     beats_per_bar = ts_num * 4 / ts_den
 
-    events = sorted(sequence.get('events', []), key=lambda e: e['at_beat'])
-    if not events:
+    sorted_events = sorted(events, key=lambda e: e['at_beat'])
+    if not sorted_events:
         return []
 
-    total_beats = sequence.get('total_beats', 0.0)
+    total_beats = max(e['at_beat'] + e['duration_beats'] for e in sorted_events)
     n_bars = int(total_beats / beats_per_bar) + (1 if total_beats % beats_per_bar > 1e-6 else 0)
 
     messages = []
@@ -926,10 +1385,9 @@ def per_bar_report(sequence: dict) -> list[str]:
         bar_start = bar_i * beats_per_bar
         bar_end = bar_start + beats_per_bar
         bar_evts = [
-            e for e in events
+            e for e in sorted_events
             if e['at_beat'] >= bar_start - 1e-6 and e['at_beat'] < bar_end - 1e-6
         ]
-        # Count occupied beats in bar
         occupied = sum(
             min(e['at_beat'] + e['duration_beats'], bar_end) - e['at_beat']
             for e in bar_evts

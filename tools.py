@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterator
 
 from sequencer.abc import parse_abc, to_abc, ABCParseError, per_bar_report
-from sequencer.theory import normalize_chord_quality, chord_note_names, build_chord, parse_pitch, midi_note_name
+from sequencer.theory import normalize_chord_quality, chord_note_names, build_chord, parse_pitch, midi_note_name, voice_chord as _voice_chord, voice_progression as _voice_progression
 from sequencer.midi_io import write_sequence_midi
 import sequencer.model as seq_model
 import sequencer.engine as engine
@@ -124,7 +124,22 @@ For original compositions and generic theory demonstrations (scales, chord progr
 
 When a recording appears (a sequence with source='recording'), use **read_sequence** to see the quantized notes *and* timing deviations before commenting. Critique both:
 - **Note choice** — are the notes in the stated key/scale/target piece?
-- **Timing** — use the per-note ms deviation table (early/late) to give specific feedback, e.g. "bar 2 beat 3 was 45 ms early." Focus on patterns (consistently rushing, late entries) rather than listing every note."""
+- **Timing** — use the per-note ms deviation table (early/late) to give specific feedback, e.g. "bar 2 beat 3 was 45 ms early." Focus on patterns (consistently rushing, late entries) rather than listing every note.
+
+## Arranging workflow (multi-voice)
+
+Use this exact recipe when asked to arrange a piece as a ballad or multi-voice arrangement:
+
+1. **Import/write the melody as voice 1.** Use `import_corpus` or write ABC manually. Store with `create_sequence`. Verify with `check_abc` — read the per-voice report until clean.
+2. **Decide the harmonic rhythm** (how many beats per chord). Call `voice_progression` with your chord list and the relevant melody notes; copy the returned `abc_line` verbatim into `[V:2]`.
+3. **Write the bass last** in `[V:3]` (or `[V:3] octave=-1`). Bass typically plays roots and fifths; keep it simple.
+4. **Call `check_abc`** on the full multi-voice ABC. Read the per-voice bar report; fix any mismatch errors before proceeding.
+5. **Add dynamics and fermatas only after pitches are correct.** Add `!p!` / `!mf!` / `!f!` before note events; add `!fermata!` at phrase endings. Use `[Q:bpm]` inline for tempo changes.
+
+**Critical rules:**
+- Never hand-construct voicings below the melody — always use `voice_chord` or `voice_progression`.
+- `update_sequence` accepts `bar_edits: [{voice, bar, abc}]` so you can fix one voice's bar without re-emitting the whole piece.
+- Multi-voice ABC format: `V:` declaration lines after `K:`, then `[V:1] bars | [V:2] bars |` etc. Stacked [V:id] lines only — no mid-line [V:] switching."""
 
 # ── Tool schemas ──────────────────────────────────────────────────────────────
 
@@ -416,14 +431,31 @@ TOOLS = [
     },
     {
         "name": "update_sequence",
-        "description": "Replace the ABC content of a persistent sequence (appends a revision). Supply full corrected ABC.",
+        "description": (
+            "Replace the ABC content of a persistent sequence (appends a revision). "
+            "Supply full corrected ABC, or use bar_edits for targeted single-voice bar fixes. "
+            "bar_edits: [{voice: '2', bar: 3, abc: 'c d e f'}] replaces that bar in that voice only."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "sequence_id": {"type": "string", "description": "ID returned by create_sequence."},
-                "abc": {"type": "string", "description": "Replacement ABC notation (full ABC with headers)."},
+                "abc": {"type": "string", "description": "Replacement ABC notation (full ABC with headers). Omit if using bar_edits."},
+                "bar_edits": {
+                    "type": "array",
+                    "description": "Voice-aware bar replacements. Each: {voice: '2', bar: 3, abc: '<bar content without barlines>'}.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "voice": {"type": "string"},
+                            "bar": {"type": "integer"},
+                            "abc": {"type": "string"},
+                        },
+                        "required": ["voice", "bar", "abc"],
+                    },
+                },
             },
-            "required": ["sequence_id", "abc"],
+            "required": ["sequence_id"],
         },
     },
     {
@@ -447,6 +479,76 @@ TOOLS = [
                 "session_id": {"type": "string", "description": "Session ID (omit to list all sequences)."},
             },
             "required": [],
+        },
+    },
+    {
+        "name": "voice_chord",
+        "description": (
+            "Return a concrete voicing for a chord — note names, MIDI numbers, and a ready-to-paste ABC chord token. "
+            "Deterministic: enforces low-interval limits, keeps guide tones (3rd/7th), and respects the melody note. "
+            "Never hand-construct voicings below the melody — use this helper."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "root": {"type": "string", "description": "Root note, e.g. 'C', 'F#', 'Bb'."},
+                "quality": {"type": "string", "description": "Chord quality, e.g. 'major7', 'dominant7', 'minor7'."},
+                "melody_note": {
+                    "type": "string",
+                    "description": "Optional melody note the voicing must sit below, e.g. 'G5'. The top voicing tone will be a 3rd-6th below the melody and will not double it.",
+                },
+                "register": {
+                    "type": "string",
+                    "description": "'low' | 'mid' | 'high' — center target when no melody_note. Default 'mid'.",
+                    "enum": ["low", "mid", "high"],
+                    "default": "mid",
+                },
+                "style": {
+                    "type": "string",
+                    "description": "'close' | 'drop2' | 'shell' | 'spread'. Default 'close'.",
+                    "enum": ["close", "drop2", "shell", "spread"],
+                    "default": "close",
+                },
+                "omit_root": {
+                    "type": "boolean",
+                    "description": "Drop the root from the voicing (bass voice has it). Default false.",
+                    "default": False,
+                },
+            },
+            "required": ["root", "quality"],
+        },
+    },
+    {
+        "name": "voice_progression",
+        "description": (
+            "Voice a chord progression with minimal-motion voice leading. "
+            "Returns a ready-to-paste ABC line for voice 2, plus a per-chord note breakdown. "
+            "Input a list of chords with symbol, beats, and optional melody_note per chord."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chords": {
+                    "type": "array",
+                    "description": "List of chords. Each: {symbol: 'Cmaj7', beats: 4, melody_note: 'E5' (optional)}.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": {"type": "string"},
+                            "beats": {"type": "number", "default": 4},
+                            "melody_note": {"type": "string"},
+                        },
+                        "required": ["symbol"],
+                    },
+                },
+                "style": {
+                    "type": "string",
+                    "description": "'close' | 'drop2' | 'shell' | 'spread'. Default 'close'.",
+                    "enum": ["close", "drop2", "shell", "spread"],
+                    "default": "close",
+                },
+            },
+            "required": ["chords"],
         },
     },
 ]
@@ -945,15 +1047,67 @@ def dispatch_tools(
 
         elif name == "update_sequence":
             seq_id = inp.get("sequence_id", "")
-            try:
-                sequence = parse_abc(inp.get("abc", ""))
-            except ABCParseError as e:
-                yield _err(f"ABC parse error:\n{e}")
-                continue
-            normalized = to_abc(sequence)
-            if not seq_model.update_sequence(seq_id, abc=normalized):
-                yield _err(f"Sequence '{seq_id}' not found.")
-                continue
+            bar_edits = inp.get("bar_edits")  # voice-aware bar edits [{voice, bar, abc}]
+            if bar_edits and not inp.get("abc"):
+                # Apply voice-aware bar edits to the stored ABC
+                row = seq_model.get_sequence(seq_id)
+                if not row:
+                    yield _err(f"Sequence '{seq_id}' not found.")
+                    continue
+                try:
+                    sequence = parse_abc(row["abc"])
+                except ABCParseError as e:
+                    yield _err(f"Stored ABC parse error:\n{e}")
+                    continue
+                # For each edit, replace events for the specified voice+bar
+                voices = sequence.get("voices") or []
+                bpb = sequence["time_signature_parts"][0] * 4 / sequence["time_signature_parts"][1]
+                for edit in bar_edits:
+                    vid = str(edit.get("voice", "1"))
+                    bar_n = int(edit.get("bar", 1))
+                    bar_abc = edit.get("abc", "")
+                    bar_start = (bar_n - 1) * bpb
+                    bar_end = bar_n * bpb
+                    # Parse the new bar's content
+                    try:
+                        sub_seq = parse_abc(f"X:1\nT:T\nM:{sequence['time_signature']}\nL:1/4\nQ:{int(sequence['tempo_bpm'])}\nK:{sequence.get('key','C')}\n{bar_abc} |")
+                        new_evts = sub_seq["events"]
+                    except ABCParseError as e:
+                        yield _err(f"Bar edit parse error (voice {vid}, bar {bar_n}): {e}")
+                        break
+                    # Offset new events to bar_start
+                    for e in new_evts:
+                        e["at_beat"] = e["at_beat"] + bar_start
+                        if voices:
+                            e["voice"] = vid
+                    # Remove existing events for this voice+bar
+                    sequence["events"] = [
+                        e for e in sequence["events"]
+                        if not (e.get("voice", "1") == vid and e["at_beat"] >= bar_start - 1e-9 and e["at_beat"] < bar_end - 1e-9)
+                    ]
+                    sequence["events"].extend(new_evts)
+                    sequence["events"].sort(key=lambda e: (e["at_beat"], e.get("voice", "1")))
+                else:
+                    normalized = to_abc(sequence)
+                    if not seq_model.update_sequence(seq_id, abc=normalized):
+                        yield _err(f"Sequence '{seq_id}' not found.")
+                        continue
+                    bar_msgs = per_bar_report(sequence)
+                    lines = [f"Updated sequence '{seq_id}' (bar edits applied).", "", "Per-bar report:"]
+                    lines += (bar_msgs if bar_msgs else ["  All bars correct."])
+                    lines += ["", "Normalized ABC (stored):", normalized]
+                    yield _ok("\n".join(lines))
+                    continue
+            else:
+                try:
+                    sequence = parse_abc(inp.get("abc", ""))
+                except ABCParseError as e:
+                    yield _err(f"ABC parse error:\n{e}")
+                    continue
+                normalized = to_abc(sequence)
+                if not seq_model.update_sequence(seq_id, abc=normalized):
+                    yield _err(f"Sequence '{seq_id}' not found.")
+                    continue
             bar_msgs = per_bar_report(sequence)
             lines = [
                 f"Updated sequence '{seq_id}'.",
@@ -993,3 +1147,40 @@ def dispatch_tools(
                 for s in seqs:
                     lines.append(f"  {s['id']}  {s['title']}  ({s['time_signature']}, {s['tempo_bpm']} bpm)")
                 yield _ok("\n".join(lines))
+
+        elif name == "voice_chord":
+            root = inp.get("root", "C")
+            quality = inp.get("quality", "major")
+            melody_note = inp.get("melody_note")
+            register = inp.get("register", "mid")
+            style = inp.get("style", "close")
+            omit_root = bool(inp.get("omit_root", False))
+            try:
+                result = _voice_chord(root, quality, melody_note=melody_note,
+                                      register=register, style=style, omit_root=omit_root)
+            except Exception as e:
+                yield _err(f"voice_chord error: {e}")
+                continue
+            lines = [
+                f"Voicing: {root} {quality} (style={style})",
+                f"Notes (bottom to top): {', '.join(result['notes'])}",
+                f"MIDI: {result['midi']}",
+                f"ABC chord token: {result['abc']}",
+            ]
+            if melody_note:
+                lines.append(f"Sits below melody note: {melody_note}")
+            yield _ok("\n".join(lines))
+
+        elif name == "voice_progression":
+            chords = inp.get("chords", [])
+            style = inp.get("style", "close")
+            try:
+                result = _voice_progression(chords, style=style)
+            except Exception as e:
+                yield _err(f"voice_progression error: {e}")
+                continue
+            lines = ["Voiced progression:"]
+            for v in result["voicings"]:
+                lines.append(f"  {v['symbol']} ({v['beats']} beats): {', '.join(v['notes'])}  →  {v['abc']}")
+            lines += ["", f"ABC line for [V:2]:", result["abc_line"]]
+            yield _ok("\n".join(lines))

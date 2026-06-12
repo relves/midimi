@@ -116,92 +116,133 @@ def _load_bytes(data: bytes, filename: str) -> stream.Score:
     return s
 
 
+MAX_IMPORT_VOICES = 4
+
+
 def _score_to_sequence(s) -> tuple[dict, str]:
-    """Convert a music21 Score/Part/Stream to our internal sequence dict."""
+    """Convert a music21 Score/Part/Stream to our internal sequence dict.
+
+    Maps up to MAX_IMPORT_VOICES (4) parts onto voices; reports any dropped.
+    """
     dropped: list[str] = []
 
-    # Flatten to a single part (melody) — take the top part of a score
-    if hasattr(s, 'parts') and len(s.parts) > 1:
-        dropped.append(f"Flattened {len(s.parts)} parts to melody (top part only).")
-        part = s.parts[0]
-    elif hasattr(s, 'parts') and len(s.parts) == 1:
-        part = s.parts[0]
+    # Collect parts (up to MAX_IMPORT_VOICES)
+    if hasattr(s, 'parts') and len(s.parts) >= 1:
+        all_parts = list(s.parts)
     else:
-        part = s
+        all_parts = [s]
 
-    flat = part.flatten()
+    if len(all_parts) > MAX_IMPORT_VOICES:
+        n_dropped = len(all_parts) - MAX_IMPORT_VOICES
+        dropped.append(f"Dropped {n_dropped} part(s) beyond the {MAX_IMPORT_VOICES}-voice limit.")
+        all_parts = all_parts[:MAX_IMPORT_VOICES]
 
-    # Extract metadata
+    use_voices = len(all_parts) > 1
+
+    # Extract metadata from score
     title = "Untitled"
     if hasattr(s, 'metadata') and s.metadata and s.metadata.title:
         title = s.metadata.title
 
-    # Tempo
+    # Tempo and time signature from the first (top) part
+    top_flat = all_parts[0].flatten()
+
     tempo_bpm = 96.0
-    for mm in flat.getElementsByClass(m21tempo.MetronomeMark):
+    for mm in top_flat.getElementsByClass(m21tempo.MetronomeMark):
         if mm.number:
             tempo_bpm = float(mm.number)
             break
 
-    # Time signature
     ts_num, ts_den = 4, 4
-    for ts in flat.getElementsByClass(m21meter.TimeSignature):
+    for ts in top_flat.getElementsByClass(m21meter.TimeSignature):
         ts_num = ts.numerator
         ts_den = ts.denominator
         break
     time_signature = f"{ts_num}/{ts_den}"
     beats_per_bar = ts_num * 4 / ts_den
 
-    # Key
     key_str = "C"
-    for ks in flat.getElementsByClass(m21key.KeySignature):
+    for ks in top_flat.getElementsByClass(m21key.KeySignature):
         key_str = ks.asKey().tonic.name + ("m" if ks.asKey().mode == "minor" else "")
         break
 
-    # Events: walk notes/chords, cap at MAX_BARS bars
-    events: list[dict] = []
-    max_offset = MAX_BARS * beats_per_bar  # in quarter-note beats
+    max_offset = MAX_BARS * beats_per_bar
 
-    for element in flat.notesAndRests:
-        offset_beats = float(element.offset)  # music21 offset in quarter notes
-        if offset_beats >= max_offset:
-            dropped.append(f"Truncated at {MAX_BARS} bars.")
-            break
-        dur_beats = float(element.quarterLength)
-        if dur_beats <= 0:
-            continue
+    all_events: list[dict] = []
+    voice_decls: list[dict] = []
 
-        if isinstance(element, m21note.Rest):
-            continue  # rests are implicit gaps between events
+    # Assign channels (skip 9)
+    ch = 0
+    for idx, part in enumerate(all_parts):
+        vid = str(idx + 1)
+        # Try to get a part name
+        part_name = ""
+        if hasattr(part, 'partName') and part.partName:
+            part_name = part.partName
+        elif hasattr(part, 'id') and part.id:
+            part_name = str(part.id)
+        else:
+            part_name = f"voice{vid}"
 
-        if isinstance(element, m21note.Note):
-            midi = element.pitch.midi
-            name = _pitch_name(element.pitch)
-            events.append(_make_event(offset_beats, dur_beats, [midi], [name]))
+        if ch == 9:
+            ch += 1
+        voice_decls.append({
+            'id': vid,
+            'name': part_name,
+            'octave_shift': 0,
+            'channel': ch,
+            'program': 0,
+        })
+        ch += 1
 
-        elif isinstance(element, m21chord.Chord):
-            midis = [p.midi for p in element.pitches]
-            names = [_pitch_name(p) for p in element.pitches]
-            events.append(_make_event(offset_beats, dur_beats, midis, names))
+        flat = part.flatten()
+        truncated = False
+        for element in flat.notesAndRests:
+            offset_beats = float(element.offset)
+            if offset_beats >= max_offset:
+                if not truncated:
+                    dropped.append(f"Part {part_name}: truncated at {MAX_BARS} bars.")
+                    truncated = True
+                break
+            dur_beats = float(element.quarterLength)
+            if dur_beats <= 0:
+                continue
+            if isinstance(element, m21note.Rest):
+                continue
+            if isinstance(element, m21note.Note):
+                midi = element.pitch.midi
+                name = _pitch_name(element.pitch)
+                evt = _make_event(offset_beats, dur_beats, [midi], [name])
+            elif isinstance(element, m21chord.Chord):
+                midis = [p.midi for p in element.pitches]
+                names = [_pitch_name(p) for p in element.pitches]
+                evt = _make_event(offset_beats, dur_beats, midis, names)
+            else:
+                continue
+            if use_voices:
+                evt['voice'] = vid
+            all_events.append(evt)
 
-    if not events:
+    if not all_events:
         raise ValueError("No notes found in score.")
 
-    # Cap per dynamics/etc report
-    total_beats = max(e["at_beat"] + e["duration_beats"] for e in events)
+    total_beats = max(e["at_beat"] + e["duration_beats"] for e in all_events)
     duration_ms = int(total_beats * 60 / tempo_bpm * 1000)
 
-    seq = {
+    seq: dict = {
         "title": title,
         "tempo_bpm": tempo_bpm,
         "time_signature": time_signature,
         "time_signature_parts": (ts_num, ts_den),
         "key": key_str,
-        "events": events,
+        "events": all_events,
         "total_beats": total_beats,
         "duration_ms": duration_ms,
         "abc_errors": [],
     }
+    if use_voices:
+        seq["voices"] = voice_decls
+
     return seq, "\n".join(dropped) if dropped else ""
 
 
@@ -219,12 +260,24 @@ def _pitch_name(pitch) -> str:
 
 # ── MIDI export ───────────────────────────────────────────────────────────────
 
-def write_sequence_midi(sequence: dict, sequence_id: str, dest_dir: Path | None = None) -> Path:
-    """Serialize a sequence dict to a MIDI file. Returns the Path written."""
+def write_sequence_midi(
+    sequence: dict,
+    sequence_id: str,
+    dest_dir: Path | None = None,
+    expressive: bool = True,
+) -> Path:
+    """Serialize a sequence dict to a MIDI file. Returns the Path written.
+
+    Multi-voice sequences write a type-1 file with one named track per voice.
+    Single-voice sequences write a type-0 file (unchanged behavior).
+
+    expressive=True uses performed timing (fermata stretch etc.); False uses
+    written timing (not yet implemented -- reserved for Phase 5.3).
+    """
     import mido as _mido
 
-    DEFAULT_CHANNEL = 0
-    DEFAULT_INSTRUMENT = 0
+    _DEFAULT_CHANNEL = 0
+    _DEFAULT_INSTRUMENT = 0
     MIDI_TICKS_PER_BEAT = 480
 
     if dest_dir is None:
@@ -233,43 +286,105 @@ def write_sequence_midi(sequence: dict, sequence_id: str, dest_dir: Path | None 
     midi_path = dest_dir / f"{sequence_id}.mid"
 
     def _midi_meta_text(value: str) -> str:
-        replacements = {"–": "-", "—": "-", "‘": "'",
-                        "’": "'", "“": '"', "”": '"'}
+        replacements = {"–": "-", "—": "-", "'": "'",
+                        "'": "'", """: '"', """: '"'}
         text = "".join(replacements.get(ch, ch) for ch in str(value))
         return text.encode("latin-1", "replace").decode("latin-1")
 
-    mid = _mido.MidiFile(ticks_per_beat=MIDI_TICKS_PER_BEAT)
-    track = _mido.MidiTrack()
-    mid.tracks.append(track)
+    voices = sequence.get("voices")
 
-    ts_numerator, ts_denominator = sequence["time_signature_parts"]
-    track.append(_mido.MetaMessage("track_name", name=_midi_meta_text(sequence["title"]), time=0))
-    track.append(_mido.MetaMessage("set_tempo", tempo=_mido.bpm2tempo(sequence["tempo_bpm"]), time=0))
-    track.append(_mido.MetaMessage(
-        "time_signature",
-        numerator=ts_numerator,
-        denominator=ts_denominator,
-        time=0,
-    ))
-    track.append(_mido.Message("program_change", channel=DEFAULT_CHANNEL, program=DEFAULT_INSTRUMENT, time=0))
+    if voices and len(voices) > 1:
+        # ── Type-1 MIDI: one track per voice ──────────────────────────────────
+        mid = _mido.MidiFile(type=1, ticks_per_beat=MIDI_TICKS_PER_BEAT)
 
-    midi_events = []
-    for event in sequence["events"]:
-        start_tick = int(round(event["at_beat"] * MIDI_TICKS_PER_BEAT))
-        end_tick = int(round((event["at_beat"] + event["duration_beats"]) * MIDI_TICKS_PER_BEAT))
-        for note in event["notes"]:
-            midi_events.append((start_tick, 1, note, event["velocity"]))
-            midi_events.append((end_tick, 0, note, 0))
+        # Tempo track
+        tempo_track = _mido.MidiTrack()
+        mid.tracks.append(tempo_track)
+        ts_numerator, ts_denominator = sequence["time_signature_parts"]
+        tempo_track.append(_mido.MetaMessage("track_name", name=_midi_meta_text(sequence["title"]), time=0))
+        tempo_track.append(_mido.MetaMessage("set_tempo", tempo=_mido.bpm2tempo(sequence["tempo_bpm"]), time=0))
+        tempo_track.append(_mido.MetaMessage(
+            "time_signature",
+            numerator=ts_numerator,
+            denominator=ts_denominator,
+            time=0,
+        ))
+        tempo_track.append(_mido.MetaMessage("end_of_track", time=0))
 
-    midi_events.sort(key=lambda item: (item[0], item[1]))
-    last_tick = 0
-    for tick, kind, note, velocity in midi_events:
-        delta = max(0, tick - last_tick)
-        msg_type = "note_on" if kind else "note_off"
-        track.append(_mido.Message(msg_type, channel=DEFAULT_CHANNEL, note=note, velocity=velocity, time=delta))
-        last_tick = tick
+        # Group events by voice
+        voice_channel_map = {v["id"]: v.get("channel", i) for i, v in enumerate(voices)}
+        voice_name_map = {v["id"]: v.get("name", v["id"]) for v in voices}
+        events_by_voice: dict[str, list[dict]] = {v["id"]: [] for v in voices}
+        for event in sequence["events"]:
+            vid = event.get("voice", voices[0]["id"])
+            if vid in events_by_voice:
+                events_by_voice[vid].append(event)
 
-    track.append(_mido.MetaMessage("end_of_track", time=0))
+        for v in voices:
+            vid = v["id"]
+            channel = voice_channel_map[vid]
+            program = v.get("program", 0)
+            vtrack = _mido.MidiTrack()
+            mid.tracks.append(vtrack)
+            vtrack.append(_mido.MetaMessage(
+                "track_name", name=_midi_meta_text(voice_name_map[vid]), time=0
+            ))
+            vtrack.append(_mido.Message(
+                "program_change", channel=channel, program=program, time=0
+            ))
+            midi_events = []
+            for event in events_by_voice[vid]:
+                start_tick = int(round(event["at_beat"] * MIDI_TICKS_PER_BEAT))
+                end_tick = int(round((event["at_beat"] + event["duration_beats"]) * MIDI_TICKS_PER_BEAT))
+                for note in event["notes"]:
+                    midi_events.append((start_tick, 1, note, event["velocity"]))
+                    midi_events.append((end_tick, 0, note, 0))
+            midi_events.sort(key=lambda item: (item[0], item[1]))
+            last_tick = 0
+            for tick, kind, note, velocity in midi_events:
+                delta = max(0, tick - last_tick)
+                msg_type = "note_on" if kind else "note_off"
+                vtrack.append(_mido.Message(
+                    msg_type, channel=channel, note=note, velocity=velocity, time=delta
+                ))
+                last_tick = tick
+            vtrack.append(_mido.MetaMessage("end_of_track", time=0))
+
+    else:
+        # ── Type-0 MIDI: single track (unchanged behavior) ────────────────────
+        mid = _mido.MidiFile(type=0, ticks_per_beat=MIDI_TICKS_PER_BEAT)
+        track = _mido.MidiTrack()
+        mid.tracks.append(track)
+
+        ts_numerator, ts_denominator = sequence["time_signature_parts"]
+        track.append(_mido.MetaMessage("track_name", name=_midi_meta_text(sequence["title"]), time=0))
+        track.append(_mido.MetaMessage("set_tempo", tempo=_mido.bpm2tempo(sequence["tempo_bpm"]), time=0))
+        track.append(_mido.MetaMessage(
+            "time_signature",
+            numerator=ts_numerator,
+            denominator=ts_denominator,
+            time=0,
+        ))
+        track.append(_mido.Message("program_change", channel=_DEFAULT_CHANNEL, program=_DEFAULT_INSTRUMENT, time=0))
+
+        midi_events = []
+        for event in sequence["events"]:
+            start_tick = int(round(event["at_beat"] * MIDI_TICKS_PER_BEAT))
+            end_tick = int(round((event["at_beat"] + event["duration_beats"]) * MIDI_TICKS_PER_BEAT))
+            for note in event["notes"]:
+                midi_events.append((start_tick, 1, note, event["velocity"]))
+                midi_events.append((end_tick, 0, note, 0))
+
+        midi_events.sort(key=lambda item: (item[0], item[1]))
+        last_tick = 0
+        for tick, kind, note, velocity in midi_events:
+            delta = max(0, tick - last_tick)
+            msg_type = "note_on" if kind else "note_off"
+            track.append(_mido.Message(msg_type, channel=_DEFAULT_CHANNEL, note=note, velocity=velocity, time=delta))
+            last_tick = tick
+
+        track.append(_mido.MetaMessage("end_of_track", time=0))
+
     mid.save(midi_path)
     return midi_path
 

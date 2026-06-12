@@ -301,28 +301,110 @@ def _parse_bars(bars_str: str | None, beats_per_bar: float) -> tuple[float, floa
     return start, end
 
 
+_DEFAULT_GATE = 0.90        # default gate length (fraction of written duration)
+_STACCATO_GATE = 0.50
+_TENUTO_GATE = 1.00
+_ACCENT_VELOCITY_BOOST = 18
+_FERMATA_FACTOR = 1.8
+
+
+def _beats_to_seconds(
+    beat: float,
+    start_beat: float,
+    tempo_segments: list[tuple[float, float]],
+) -> float:
+    """Convert a beat position to seconds using piecewise tempo segments.
+
+    tempo_segments: list of (beat_start, seconds_per_beat) sorted ascending by beat_start.
+    """
+    t = 0.0
+    prev_beat = start_beat
+    for seg_beat, spb in tempo_segments:
+        if beat <= seg_beat:
+            break
+        t += (min(beat, seg_beat) - prev_beat) * spb
+        prev_beat = seg_beat
+    t += (beat - prev_beat) * tempo_segments[-1][1]
+    return t
+
+
 def _run_sequence(sequence_id: str, sequence: dict, bars: str | None) -> None:
     ts_num, ts_den = sequence["time_signature_parts"]
     beats_per_bar = ts_num * 4 / ts_den
-    seconds_per_beat = 60 / sequence["tempo_bpm"]
 
     start_beat, end_beat = _parse_bars(bars, beats_per_bar)
 
+    # Build piecewise tempo segments: [(beat_position, seconds_per_beat), ...]
+    base_spb = 60 / sequence["tempo_bpm"]
+    tempo_segments: list[tuple[float, float]] = [(start_beat, base_spb)]
+    for event in sorted(sequence.get("events", []), key=lambda e: e["at_beat"]):
+        if event.get("quality") == "tempo_change" and "tempo_bpm" in event:
+            eb = event["at_beat"]
+            if eb >= start_beat and eb < end_beat:
+                tempo_segments.append((eb, 60 / event["tempo_bpm"]))
+    tempo_segments.sort(key=lambda x: x[0])
+
+    def _b2s(beat: float) -> float:
+        """Beat position → seconds since start_beat."""
+        t = 0.0
+        prev_b = start_beat
+        prev_spb = base_spb
+        for seg_b, seg_spb in tempo_segments[1:]:
+            if beat <= seg_b:
+                break
+            t += (seg_b - prev_b) * prev_spb
+            prev_b = seg_b
+            prev_spb = seg_spb
+        t += (beat - prev_b) * prev_spb
+        return t
+
+    # Build voice→channel map from voices metadata (skip ch 9)
+    voices = sequence.get("voices") or []
+    voice_channel: dict[str, int] = {}
+    if voices:
+        for v in voices:
+            voice_channel[v["id"]] = v.get("channel", 0)
+
     # Build sorted action list within the bar range
-    actions: list[tuple[float, int, int, int]] = []  # (abs_time_s, kind 1=on/0=off, note, velocity)
+    # Each action: (abs_time_s, kind 1=on/0=off, note, velocity, channel)
+    actions: list[tuple[float, int, int, int, int]] = []
     for event in sequence["events"]:
+        if event.get("quality") == "tempo_change":
+            continue  # already consumed above
         eb = event["at_beat"]
         ee = eb + event["duration_beats"]
         if eb >= end_beat - 1e-9 or ee <= start_beat + 1e-9:
             continue
+
+        # Gate length: staccato, tenuto, or default
+        if event.get("staccato"):
+            gate = _STACCATO_GATE
+        elif event.get("tenuto"):
+            gate = _TENUTO_GATE
+        else:
+            gate = _DEFAULT_GATE
+
+        # Velocity: running + accent boost
+        velocity = event.get("velocity", DEFAULT_VELOCITY)
+        if event.get("accent"):
+            velocity = min(127, velocity + _ACCENT_VELOCITY_BOOST)
+
+        # Written duration with fermata stretch
+        written_dur = event["duration_beats"]
+        if event.get("fermata"):
+            written_dur = written_dur * _FERMATA_FACTOR
+
         # Clamp to range
         play_start = max(eb, start_beat)
-        play_end = min(ee, end_beat)
-        t_on = (play_start - start_beat) * seconds_per_beat
-        t_off = (play_end - start_beat) * seconds_per_beat
+        play_end_written = min(eb + written_dur, end_beat)
+        play_end_gate = min(eb + written_dur * gate, end_beat)
+
+        t_on = _b2s(play_start)
+        t_off = _b2s(play_end_gate)
+        channel = voice_channel.get(event.get("voice", ""), DEFAULT_CHANNEL)
         for note in event["notes"]:
-            actions.append((t_on, 1, note, event["velocity"]))
-            actions.append((t_off, 0, note, 0))
+            actions.append((t_on, 1, note, velocity, channel))
+            actions.append((t_off, 0, note, 0, channel))
 
     actions.sort(key=lambda a: (a[0], a[1]))
 
@@ -332,9 +414,9 @@ def _run_sequence(sequence_id: str, sequence: dict, bars: str | None) -> None:
         with _play_lock:
             _stop_event.clear()
             t0 = time.monotonic()
-            sounding: list[int] = []
+            sounding: list[tuple[int, int]] = []  # (note, channel)
             try:
-                for action_time, kind, note, velocity in actions:
+                for action_time, kind, note, velocity, channel in actions:
                     if _stop_event.is_set():
                         break
                     sleep_for = t0 + action_time - time.monotonic()
@@ -343,15 +425,15 @@ def _run_sequence(sequence_id: str, sequence: dict, bars: str | None) -> None:
                     if _stop_event.is_set():
                         break
                     if kind:
-                        _note_on_fn(note, velocity, DEFAULT_CHANNEL)
-                        sounding.append(note)
+                        _note_on_fn(note, velocity, channel)
+                        sounding.append((note, channel))
                     else:
-                        _note_off_fn(note, DEFAULT_CHANNEL)
-                        if note in sounding:
-                            sounding.remove(note)
+                        _note_off_fn(note, channel)
+                        if (note, channel) in sounding:
+                            sounding.remove((note, channel))
             finally:
-                for note in sounding:
-                    _note_off_fn(note, DEFAULT_CHANNEL)
+                for note, channel in sounding:
+                    _note_off_fn(note, channel)
     finally:
         with _currently_playing_lock:
             _currently_playing.discard(sequence_id)

@@ -755,6 +755,9 @@ def record_stop(req: RecordStopRequest):
     duration_ms = seq_dict.get("duration_ms", 1000)
     pill_html = sequence_pill(seq_id, req.title, f"pill-{seq_id}", duration_ms, midi_url, seq_dict["events"])
 
+    # Register in-memory so play works immediately (before any history reload)
+    _sequence_registry[seq_id] = {"sequence": seq_dict, "midi_path": midi_path}
+
     # Persist to chat history so it survives reload
     record_entry = {
         "type": "sequence",
@@ -909,6 +912,16 @@ def chat_stream(req: ChatRequest):
             parts = msg["content"]
             if isinstance(parts, list):
                 api_parts = [p for p in parts if p.get("type") in ("text", "tool_use")]
+                # Expose recordings/sequences as text so the agent can reference them
+                seq_summaries = []
+                for p in parts:
+                    if p.get("type") == "sequence":
+                        seq_summaries.append(
+                            f"[Recording captured: id={p['sequence_id']}, title={p.get('title','Recording')}, "
+                            f"duration={p.get('duration_ms',0)//1000}s]"
+                        )
+                if seq_summaries:
+                    api_parts = [{"type": "text", "text": "\n".join(seq_summaries)}] + api_parts
                 if api_parts:
                     anthropic_history.append({"role": "assistant", "content": api_parts})
 
