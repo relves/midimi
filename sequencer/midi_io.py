@@ -217,6 +217,63 @@ def _pitch_name(pitch) -> str:
     return f"{letter}{acc_str}{octave}"
 
 
+# ── MIDI export ───────────────────────────────────────────────────────────────
+
+def write_sequence_midi(sequence: dict, sequence_id: str, dest_dir: Path | None = None) -> Path:
+    """Serialize a sequence dict to a MIDI file. Returns the Path written."""
+    import mido as _mido
+
+    DEFAULT_CHANNEL = 0
+    DEFAULT_INSTRUMENT = 0
+    MIDI_TICKS_PER_BEAT = 480
+
+    if dest_dir is None:
+        dest_dir = Path(__file__).parent.parent / "generated" / "orchestrations"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    midi_path = dest_dir / f"{sequence_id}.mid"
+
+    def _midi_meta_text(value: str) -> str:
+        replacements = {"–": "-", "—": "-", "‘": "'",
+                        "’": "'", "“": '"', "”": '"'}
+        text = "".join(replacements.get(ch, ch) for ch in str(value))
+        return text.encode("latin-1", "replace").decode("latin-1")
+
+    mid = _mido.MidiFile(ticks_per_beat=MIDI_TICKS_PER_BEAT)
+    track = _mido.MidiTrack()
+    mid.tracks.append(track)
+
+    ts_numerator, ts_denominator = sequence["time_signature_parts"]
+    track.append(_mido.MetaMessage("track_name", name=_midi_meta_text(sequence["title"]), time=0))
+    track.append(_mido.MetaMessage("set_tempo", tempo=_mido.bpm2tempo(sequence["tempo_bpm"]), time=0))
+    track.append(_mido.MetaMessage(
+        "time_signature",
+        numerator=ts_numerator,
+        denominator=ts_denominator,
+        time=0,
+    ))
+    track.append(_mido.Message("program_change", channel=DEFAULT_CHANNEL, program=DEFAULT_INSTRUMENT, time=0))
+
+    midi_events = []
+    for event in sequence["events"]:
+        start_tick = int(round(event["at_beat"] * MIDI_TICKS_PER_BEAT))
+        end_tick = int(round((event["at_beat"] + event["duration_beats"]) * MIDI_TICKS_PER_BEAT))
+        for note in event["notes"]:
+            midi_events.append((start_tick, 1, note, event["velocity"]))
+            midi_events.append((end_tick, 0, note, 0))
+
+    midi_events.sort(key=lambda item: (item[0], item[1]))
+    last_tick = 0
+    for tick, kind, note, velocity in midi_events:
+        delta = max(0, tick - last_tick)
+        msg_type = "note_on" if kind else "note_off"
+        track.append(_mido.Message(msg_type, channel=DEFAULT_CHANNEL, note=note, velocity=velocity, time=delta))
+        last_tick = tick
+
+    track.append(_mido.MetaMessage("end_of_track", time=0))
+    mid.save(midi_path)
+    return midi_path
+
+
 def _make_event(at_beat: float, duration_beats: float, notes: list[int], note_names: list[str]) -> dict:
     root = note_names[0][:-1] if note_names and note_names[0][-1:].isdigit() else (note_names[0] if note_names else "C")
     octave = notes[0] // 12 - 1 if notes else 4

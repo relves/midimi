@@ -18,8 +18,11 @@ import mido
 from sequencer.abc import parse_abc, to_abc, ABCParseError, per_bar_report
 from sequencer.theory import (
     normalize_chord_quality, chord_note_names, build_chord, parse_pitch,
-    NOTE_NAMES, CHORD_INTERVALS,
+    NOTE_NAMES, CHORD_INTERVALS, midi_note_name as _theory_midi_note_name,
 )
+import sequencer.model as seq_model
+import sequencer.engine as engine
+from tools import TOOLS, SYSTEM_PROMPT, dispatch_tools
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
@@ -27,22 +30,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 
-_DURATION_BEATS = {
-    "whole": 4.0,
-    "half": 2.0,
-    "quarter": 1.0,
-    "eighth": 0.5,
-    "sixteenth": 0.25,
-    "thirty_second": 0.125,
-}
 
-_SHARP_NAMES = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"]
-_FLAT_NAMES  = ["C", "D♭", "D", "E♭", "E", "F", "G♭", "G", "A♭", "A", "B♭", "B"]
-
-
-def midi_note_name(n: int, prefer_flats: bool = False) -> str:
-    names = _FLAT_NAMES if prefer_flats else _SHARP_NAMES
-    return f"{names[n % 12]}{n // 12 - 1}"
+midi_note_name = _theory_midi_note_name
 
 
 SOUNDFONT = os.environ.get("SOUNDFONT", str(Path.home() / "Music" / "GeneralUser-GS.sf2"))
@@ -56,342 +45,6 @@ DEFAULT_DURATION_MS = 1500
 MIDI_TICKS_PER_BEAT = 480
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
-
-SYSTEM_PROMPT = """You are an expert music theory teacher. You explain concepts clearly, use examples, and make learning engaging.
-
-## Playback tools
-
-- Use **play_notes** for one isolated chord, interval, or single note.
-- Use **play_abc** for any melody, progression, or rhythmic example longer than a single chord. This is the primary tool for sequences — it accepts ABC notation and gives you per-bar feedback.
-- Use **check_abc** to validate ABC before playing when correctness is critical (e.g. anything more than a couple of bars, or when meter or rhythm matters). Read the normalized ABC and per-bar report in the result, fix any errors, then call play_abc.
-- If the user includes an image of sheet music, transcribe it to ABC notation, run check_abc, then play_abc.
-
-## ABC notation guide
-
-ABC is a text format for music. Key headers: `X:1`, `T:title`, `M:4/4`, `L:1/4`, `Q:120`, `K:C`.
-
-**Notes**: Uppercase letters = octave 3 (C=C3, middle C is `c` lowercase). Lowercase = octave 4. `'` raises an octave, `,` lowers. Examples: `C`=C3, `c`=C4, `c'`=C5, `C,`=C2.
-
-**Duration** (with `L:1/4` — recommended): bare note = quarter, `2` = half, `4` = whole, `/2` = eighth, `3/2` = dotted quarter.
-
-**Accidentals**: `^` = sharp, `_` = flat, `=` = natural. Accidentals persist within a bar; key signature applies to bare notes.
-
-**Rests**: `z` (same duration syntax as notes).
-
-**Chords**: `[ceg]` sounds C E G simultaneously. Duration multiplier after `]`.
-
-**Barlines**: `|` separates bars. The server counts beats per bar and reports errors with bar numbers. Always fill bars completely — the meter is enforced.
-
-**Example** — first 4 bars of a scale in C major, 4/4, 120 bpm:
-```
-X:1
-T:C Major Scale
-M:4/4
-L:1/4
-Q:120
-K:C
-c d e f | g a b c' | c' b a g | f e d c |
-```
-
-**Workflow for anything more than 2 bars:**
-1. Write the ABC.
-2. Call check_abc to get the per-bar report and normalized ABC.
-3. If there are errors, fix them and re-check.
-4. When clean, call play_abc with the normalized ABC from step 2.
-
-## play_notes guide
-
-For the play_notes tool, specify:
-- root: note name like "C", "F#", "Bb", "Db" (never use raw MIDI numbers)
-- quality: chord type — "note", "octave", "major", "minor", "dominant7", "major7", "minor7",
-  "diminished", "augmented", "sus2", "sus4", "minormajor7", "halfdiminished7", "diminished7",
-  "augmented7", "major9", "dominant9", "dominant7b9", "minor9", "add9", "major6", "minor6", "dominant11", "dominant13"
-  Two-note interval dyads: "m2" (half step), "M2" (whole step), "m3", "M3", "P4", "A4" (tritone), "P5", "m6", "M6", "m7", "M7"
-  Use "dominant7b9" for symbols like C7b9 or C7♭9; the flat 9 is 13 semitones above the root (Db over C), not a natural 9.
-- octave: 4 is middle (C4 = middle C). Default to 4; use 3–5 for most teaching contexts.
-- duration_ms: 800–2000ms is typical for chords
-- label: a short human-readable name like "C major" or "G7"
-
-**Interval demonstrations**: When showing multiple intervals from a root, use dyad qualities (m2, M2, m3, M3, P4, A4, P5, m6, M6, m7, M7) so both notes sound together. Never play single notes and describe them as interval pairs — the user must hear both notes simultaneously.
-
-**Accuracy rule**: Your text description must exactly match the events in your tool call. Never describe notes you didn't play.
-
-Always explain what you're playing so the user learns to connect sound to theory.
-
-## Grounding rule for existing pieces
-
-**Never reconstruct an existing named piece from memory.** LLM recall of exact pitches and rhythms is unreliable.
-
-For any named existing piece (folk tune, classical work, hymn, etc.):
-1. Call **search_corpus** first to find it in the bundled corpus.
-2. If found, call **import_corpus** to load the real notes as ABC.
-3. If not found in corpus, tell the user to supply a MIDI, MusicXML, or image file — do not guess the notes.
-
-For original compositions and generic theory demonstrations (scales, chord progressions), freely compose."""
-
-TOOLS = [
-    {
-        "name": "check_abc",
-        "description": "Parse and validate ABC notation without playing. Returns normalized ABC, per-bar beat-accounting report, and any errors. Use this before play_abc for anything more than a couple of bars.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "abc": {
-                    "type": "string",
-                    "description": "Full ABC notation string including headers (X:, T:, M:, L:, Q:, K:) and body.",
-                },
-            },
-            "required": ["abc"],
-        },
-    },
-    {
-        "name": "play_abc",
-        "description": "Parse ABC notation, save it, and play it back. Returns normalized ABC and a per-bar report so you can verify what was actually stored. Use check_abc first for complex pieces.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "abc": {
-                    "type": "string",
-                    "description": "Full ABC notation string including headers (X:, T:, M:, L:, Q:, K:) and body.",
-                },
-            },
-            "required": ["abc"],
-        },
-    },
-    {
-        "name": "play_notes",
-        "description": "Play a chord, interval, or single note. The server computes the exact MIDI notes from root + quality + octave — never guess MIDI numbers yourself.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "root": {
-                    "type": "string",
-                    "description": "Root note name, e.g. 'C', 'F#', 'Bb', 'Db'",
-                },
-                "quality": {
-                    "type": "string",
-                    "description": "Chord quality: note, octave, major, minor, dominant7, major7, minor7, diminished, augmented, sus2, sus4, minormajor7, halfdiminished7, diminished7, augmented7, major9, dominant9, dominant7b9, minor9, add9, major6, minor6, dominant11, dominant13. Two-note interval dyads: m2, M2, m3, M3, P4, A4 (tritone), P5, m6, M6, m7, M7. Shorthands like 7b9, 7♭9, C7b9, and dominant7flat9 are accepted.",
-                },
-                "octave": {
-                    "type": "integer",
-                    "description": "Octave number (4 = middle C octave). Default 4.",
-                    "default": 3,
-                },
-                "duration_ms": {
-                    "type": "integer",
-                    "description": "How long to hold the notes in milliseconds",
-                    "default": DEFAULT_DURATION_MS,
-                },
-                "label": {
-                    "type": "string",
-                    "description": "Human-readable name for what's being played, e.g. 'C major triad'",
-                },
-            },
-            "required": ["root", "quality"],
-        },
-    },
-    {
-        "name": "play_melody",
-        "description": "Create, save, and play a monophonic melody from explicit pitch names and named durations. The server computes timing and MIDI values.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "title": {
-                    "type": "string",
-                    "description": "Short human-readable title, e.g. 'C major scale'.",
-                },
-                "tempo_bpm": {
-                    "type": "number",
-                    "description": "Tempo in beats per minute. Use 60-160 for most teaching examples.",
-                    "default": 96,
-                },
-                "time_signature": {
-                    "type": "string",
-                    "description": "Time signature like 4/4, 3/4, or 6/8.",
-                    "default": "4/4",
-                },
-                "notes": {
-                    "type": "array",
-                    "description": "Ordered melody items. Use pitch for notes and rest:true or pitch:'rest' for rests.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "pitch": {
-                                "type": "string",
-                                "description": "Pitch name with octave, e.g. C4, F#4, Bb3, or 'rest'.",
-                            },
-                            "rest": {
-                                "type": "boolean",
-                                "description": "Set true for a rest.",
-                                "default": False,
-                            },
-                            "duration": {
-                                "type": "string",
-                                "description": "Named duration: whole, half, quarter, eighth, sixteenth, thirty_second, or dotted_ variants like dotted_quarter.",
-                                "default": "quarter",
-                            },
-                            "velocity": {
-                                "type": "integer",
-                                "description": "MIDI velocity 1-127. Default 90.",
-                                "default": DEFAULT_VELOCITY,
-                            },
-                            "label": {
-                                "type": "string",
-                                "description": "Optional short label for this note.",
-                            },
-                        },
-                        "required": ["duration"],
-                    },
-                    "minItems": 1,
-                    "maxItems": 128,
-                },
-            },
-            "required": ["notes"],
-        },
-    },
-    {
-        "name": "play_sequence",
-        "description": "Create, save, and play a short timed MIDI orchestration. Use this for chord progressions or note/chord sequences where timing matters.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "title": {
-                    "type": "string",
-                    "description": "Short human-readable title, e.g. 'ii-V-I in C'.",
-                },
-                "tempo_bpm": {
-                    "type": "number",
-                    "description": "Tempo in beats per minute. Use 60-160 for most teaching examples.",
-                    "default": 96,
-                },
-                "time_signature": {
-                    "type": "string",
-                    "description": "Time signature like 4/4, 3/4, or 6/8.",
-                    "default": "4/4",
-                },
-                "events": {
-                    "type": "array",
-                    "description": "Timed chords or notes. Beat 0 is the start of the sequence.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "at_beat": {
-                                "type": "number",
-                                "description": "Start time in beats from the beginning.",
-                            },
-                            "duration_beats": {
-                                "type": "number",
-                                "description": "How long to hold this event, in beats.",
-                            },
-                            "root": {
-                                "type": "string",
-                                "description": "Root note name, e.g. 'C', 'F#', 'Bb', 'Db'.",
-                            },
-                            "quality": {
-                                "type": "string",
-                                "description": "Chord quality, same values as play_notes. Use 'note' for a single note, interval dyads (m2/M2/m3/M3/P4/A4/P5/m6/M6/m7/M7) for two-note intervals. For C7b9/C7♭9 use dominant7b9.",
-                            },
-                            "octave": {
-                                "type": "integer",
-                                "description": "Octave number. Default 4.",
-                                "default": 4,
-                            },
-                            "velocity": {
-                                "type": "integer",
-                                "description": "MIDI velocity 1-127. Default 90.",
-                                "default": DEFAULT_VELOCITY,
-                            },
-                            "label": {
-                                "type": "string",
-                                "description": "Optional short label for this event, e.g. 'Dm7'.",
-                            },
-                        },
-                        "required": ["at_beat", "duration_beats", "root", "quality"],
-                    },
-                    "minItems": 1,
-                    "maxItems": 64,
-                },
-            },
-            "required": ["events"],
-        },
-    },
-    {
-        "name": "validate_sequence",
-        "description": "Validate and normalize a timed sequence without playing it. Use this to check exact notes, octaves, beat positions, gaps, overlaps, and meter before playback.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "title": {
-                    "type": "string",
-                    "description": "Short human-readable title.",
-                },
-                "tempo_bpm": {
-                    "type": "number",
-                    "description": "Tempo in beats per minute.",
-                    "default": 96,
-                },
-                "time_signature": {
-                    "type": "string",
-                    "description": "Time signature like 4/4, 3/4, or 6/8.",
-                    "default": "4/4",
-                },
-                "events": {
-                    "type": "array",
-                    "description": "Timed chords or notes to validate. Beat 0 is the start of the sequence.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "at_beat": {"type": "number"},
-                            "duration_beats": {"type": "number"},
-                            "root": {"type": "string"},
-                            "quality": {"type": "string"},
-                            "octave": {"type": "integer", "default": 4},
-                            "velocity": {"type": "integer", "default": DEFAULT_VELOCITY},
-                            "label": {"type": "string"},
-                        },
-                        "required": ["at_beat", "duration_beats", "root", "quality"],
-                    },
-                    "minItems": 1,
-                    "maxItems": 64,
-                },
-            },
-            "required": ["events"],
-        },
-    },
-    {
-        "name": "search_corpus",
-        "description": "Search the bundled music21 corpus (Bach chorales, folk tunes, etc.) for pieces by title or keyword. Returns a list of results; use import_corpus to load one. For existing named pieces, always search here first before reconstructing from memory.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Title keyword or composer/tune name to search for.",
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "Maximum number of results to return (default 5, max 20).",
-                    "default": 5,
-                },
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "import_corpus",
-        "description": "Load a piece from the bundled music21 corpus by its corpus_path (from search_corpus results). Returns normalized ABC notation and a per-bar report. Use this to get note-accurate versions of existing pieces without relying on recall.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "corpus_path": {
-                    "type": "string",
-                    "description": "The corpus_path from a search_corpus result, e.g. 'bach/bwv1.6.mxl'.",
-                },
-            },
-            "required": ["corpus_path"],
-        },
-    },
-]
 
 app = FastAPI()
 app.add_middleware(
@@ -502,6 +155,24 @@ def _init_fluidsynth():
 _note_registry: dict[str, dict] = {}
 _sequence_registry: dict[str, dict] = {}
 
+
+def _resolve_sequence(sequence_id: str) -> dict | None:
+    """Return the normalized sequence dict for playback.
+
+    Checks DB first (sequences table), then in-memory registry (legacy chat history rehydration).
+    Returns None if not found.
+    """
+    row = seq_model.get_sequence(sequence_id)
+    if row:
+        try:
+            return parse_abc(row["abc"])
+        except ABCParseError:
+            pass
+    entry = _sequence_registry.get(sequence_id)
+    if entry:
+        return entry["sequence"]
+    return None
+
 # Set of note_ids currently being played
 _currently_playing: set[str] = set()
 _currently_playing_lock = threading.Lock()
@@ -522,335 +193,19 @@ def play_in_background(notes: list[int], duration_ms: int, note_id: str | None =
     threading.Thread(target=_run, daemon=True).start()
 
 
-def _parse_time_signature(value: str) -> tuple[int, int]:
-    try:
-        numerator_s, denominator_s = value.split("/", 1)
-        numerator = int(numerator_s)
-        denominator = int(denominator_s)
-    except (AttributeError, ValueError):
-        raise ValueError("time_signature must look like '4/4'")
-    if numerator < 1 or numerator > 16 or denominator not in {1, 2, 4, 8, 16}:
-        raise ValueError("time_signature must use a numerator 1-16 and denominator 1, 2, 4, 8, or 16")
-    return numerator, denominator
-
-
-def _beats_per_measure(time_signature_parts: tuple[int, int]) -> float:
-    numerator, denominator = time_signature_parts
-    return numerator * (4 / denominator)
-
-
-def _parse_duration_beats(value: str | int | float) -> float:
-    if isinstance(value, (int, float)):
-        beats = float(value)
-    else:
-        raw = str(value or "quarter").strip().lower().replace("-", "_")
-        dotted = raw.startswith("dotted_")
-        name = raw[7:] if dotted else raw
-        beats = _DURATION_BEATS.get(name)
-        if beats is None:
-            supported = sorted(_DURATION_BEATS) + [f"dotted_{name}" for name in sorted(_DURATION_BEATS)]
-            raise ValueError(f"Unknown duration: {value!r}. Supported: {supported}")
-        if dotted:
-            beats *= 1.5
-    if beats <= 0:
-        raise ValueError("duration must be greater than 0")
-    return beats
-
-
-def _format_beat(value: float) -> str:
-    rounded = round(value, 3)
-    if rounded == int(rounded):
-        return str(int(rounded))
-    return f"{rounded:g}"
-
-
-def _sequence_warnings(sequence: dict, *, melody: bool = False) -> list[str]:
-    warnings = []
-    events = sequence["events"]
-    measure_beats = _beats_per_measure(sequence["time_signature_parts"])
-    last_end = 0.0
-    last_note = None
-
-    for idx, event in enumerate(events):
-        start = float(event["at_beat"])
-        end = start + float(event["duration_beats"])
-        if start > last_end + 0.001:
-            warnings.append(f"Gap from beat {_format_beat(last_end)} to {_format_beat(start)} before event {idx + 1}.")
-        if melody and start < last_end - 0.001:
-            warnings.append(f"Overlap at beat {_format_beat(start)}; event {idx + 1} starts before the previous melody note ends.")
-        if last_note is not None and event["notes"]:
-            interval = abs(event["notes"][0] - last_note)
-            if interval > 12:
-                warnings.append(
-                    f"Large melodic leap of {interval} semitones into {midi_note_name(event['notes'][0])} at beat {_format_beat(start)}."
-                )
-        if event["notes"]:
-            last_note = event["notes"][0]
-        last_end = max(last_end, end)
-
-    total_beats = float(sequence["total_beats"])
-    if measure_beats and total_beats:
-        remainder = total_beats % measure_beats
-        if remainder > 0.001 and abs(remainder - measure_beats) > 0.001:
-            warnings.append(
-                f"Total length is {_format_beat(total_beats)} beats, which leaves {_format_beat(remainder)} beats in the final {sequence['time_signature']} measure."
-            )
-
-    return warnings
-
-
-def _sequence_report(sequence: dict, *, warnings: list[str] | None = None) -> str:
-    lines = [
-        f"Title: {sequence['title']}",
-        f"Tempo: {_format_beat(sequence['tempo_bpm'])} bpm",
-        f"Meter: {sequence['time_signature']}",
-        f"Total: {_format_beat(sequence['total_beats'])} beats ({sequence['duration_ms']}ms)",
-        "Events:",
-    ]
-    for idx, event in enumerate(sequence["events"], start=1):
-        note_names = ", ".join(event.get("note_names") or [str(n) for n in event["notes"]])
-        midi_values = ", ".join(str(note) for note in event["notes"])
-        lines.append(
-            f"{idx}. beat {_format_beat(event['at_beat'])}, duration {_format_beat(event['duration_beats'])}: {note_names} (MIDI {midi_values})"
-        )
-    if warnings:
-        lines.append("Warnings:")
-        lines.extend(f"- {warning}" for warning in warnings)
-    else:
-        lines.append("Warnings: none")
-    return "\n".join(lines)
-
-
-def _clamp_midi_value(value: int, field: str) -> int:
-    if not isinstance(value, int) or not (0 <= value <= 127):
-        raise ValueError(f"{field} must be a MIDI value from 0 to 127")
-    return value
-
-
-def _midi_meta_text(value: str) -> str:
-    replacements = {
-        "\u2013": "-",
-        "\u2014": "-",
-        "\u2018": "'",
-        "\u2019": "'",
-        "\u201c": '"',
-        "\u201d": '"',
-    }
-    text = "".join(replacements.get(ch, ch) for ch in str(value))
-    return text.encode("latin-1", "replace").decode("latin-1")
-
-
-def build_sequence(tool_input: dict) -> dict:
-    title = str(tool_input.get("title") or "Orchestration").strip()[:80] or "Orchestration"
-    tempo_bpm = float(tool_input.get("tempo_bpm", 96))
-    if tempo_bpm < 30 or tempo_bpm > 240:
-        raise ValueError("tempo_bpm must be between 30 and 240")
-
-    time_signature = str(tool_input.get("time_signature") or "4/4")
-    ts_numerator, ts_denominator = _parse_time_signature(time_signature)
-
-    raw_events = tool_input.get("events")
-    if not isinstance(raw_events, list) or not raw_events:
-        raise ValueError("events must contain at least one timed note or chord")
-    if len(raw_events) > 64:
-        raise ValueError("events can contain at most 64 items")
-
-    events = []
-    total_beats = 0.0
-    for idx, raw_event in enumerate(raw_events):
-        if not isinstance(raw_event, dict):
-            raise ValueError(f"events[{idx}] must be an object")
-
-        at_beat = float(raw_event.get("at_beat"))
-        duration_beats = float(raw_event.get("duration_beats"))
-        if at_beat < 0:
-            raise ValueError(f"events[{idx}].at_beat must be 0 or greater")
-        if duration_beats <= 0:
-            raise ValueError(f"events[{idx}].duration_beats must be greater than 0")
-
-        root = raw_event.get("root")
-        quality = normalize_chord_quality(raw_event.get("quality"), root=root)
-        octave = int(raw_event.get("octave", 4))
-        notes = build_chord(root, quality, octave)
-        for note in notes:
-            _clamp_midi_value(note, f"events[{idx}] note")
-
-        velocity = int(raw_event.get("velocity", DEFAULT_VELOCITY))
-        if not (1 <= velocity <= 127):
-            raise ValueError(f"events[{idx}].velocity must be between 1 and 127")
-
-        label = str(raw_event.get("label") or f"{root} {quality}").strip()
-        note_names = chord_note_names(root, quality, octave)
-        events.append({
-            "at_beat": at_beat,
-            "duration_beats": duration_beats,
-            "notes": notes,
-            "note_names": note_names,
-            "root": root,
-            "quality": quality,
-            "octave": octave,
-            "velocity": velocity,
-            "label": label,
-        })
-        total_beats = max(total_beats, at_beat + duration_beats)
-
-    if total_beats > 128:
-        raise ValueError("sequence is too long; keep examples to 128 beats or less")
-
-    duration_ms = int((total_beats * 60 / tempo_bpm) * 1000)
-    return {
-        "title": title,
-        "tempo_bpm": tempo_bpm,
-        "time_signature": time_signature,
-        "time_signature_parts": (ts_numerator, ts_denominator),
-        "events": sorted(events, key=lambda event: event["at_beat"]),
-        "duration_ms": duration_ms,
-        "total_beats": total_beats,
-    }
-
-
-def build_melody(tool_input: dict) -> dict:
-    title = str(tool_input.get("title") or "Melody").strip()[:80] or "Melody"
-    tempo_bpm = float(tool_input.get("tempo_bpm", 96))
-    time_signature = str(tool_input.get("time_signature") or "4/4")
-
-    raw_notes = tool_input.get("notes")
-    if not isinstance(raw_notes, list) or not raw_notes:
-        raise ValueError("notes must contain at least one melody item")
-    if len(raw_notes) > 128:
-        raise ValueError("notes can contain at most 128 items")
-
-    events = []
-    at_beat = 0.0
-    for idx, raw_note in enumerate(raw_notes):
-        if not isinstance(raw_note, dict):
-            raise ValueError(f"notes[{idx}] must be an object")
-
-        duration_beats = _parse_duration_beats(raw_note.get("duration", "quarter"))
-        pitch = str(raw_note.get("pitch", "")).strip()
-        is_rest = bool(raw_note.get("rest")) or pitch.lower() in {"rest", "r"}
-        if is_rest:
-            at_beat += duration_beats
-            continue
-        if not pitch:
-            raise ValueError(f"notes[{idx}].pitch is required unless rest is true")
-
-        root, octave, midi_note = parse_pitch(pitch)
-        _clamp_midi_value(midi_note, f"notes[{idx}] pitch")
-
-        velocity = int(raw_note.get("velocity", DEFAULT_VELOCITY))
-        if not (1 <= velocity <= 127):
-            raise ValueError(f"notes[{idx}].velocity must be between 1 and 127")
-
-        events.append({
-            "at_beat": at_beat,
-            "duration_beats": duration_beats,
-            "root": root,
-            "quality": "note",
-            "octave": octave,
-            "velocity": velocity,
-            "label": str(raw_note.get("label") or pitch).strip(),
-        })
-        at_beat += duration_beats
-
-    if not events:
-        raise ValueError("melody must contain at least one pitched note")
-
-    sequence = build_sequence({
-        "title": title,
-        "tempo_bpm": tempo_bpm,
-        "time_signature": time_signature,
-        "events": events,
-    })
-    sequence["source"] = "melody"
-    return sequence
+from sequencer.midi_io import write_sequence_midi as _write_seq_midi
 
 
 def write_sequence_midi(sequence: dict, sequence_id: str) -> Path:
-    midi_path = GENERATED_DIR / f"{sequence_id}.mid"
-    mid = mido.MidiFile(ticks_per_beat=MIDI_TICKS_PER_BEAT)
-    track = mido.MidiTrack()
-    mid.tracks.append(track)
-
-    ts_numerator, ts_denominator = sequence["time_signature_parts"]
-    track.append(mido.MetaMessage("track_name", name=_midi_meta_text(sequence["title"]), time=0))
-    track.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(sequence["tempo_bpm"]), time=0))
-    track.append(mido.MetaMessage(
-        "time_signature",
-        numerator=ts_numerator,
-        denominator=ts_denominator,
-        time=0,
-    ))
-    track.append(mido.Message("program_change", channel=DEFAULT_CHANNEL, program=DEFAULT_INSTRUMENT, time=0))
-
-    midi_events = []
-    for event in sequence["events"]:
-        start_tick = int(round(event["at_beat"] * MIDI_TICKS_PER_BEAT))
-        end_tick = int(round((event["at_beat"] + event["duration_beats"]) * MIDI_TICKS_PER_BEAT))
-        for note in event["notes"]:
-            midi_events.append((start_tick, 1, note, event["velocity"]))
-            midi_events.append((end_tick, 0, note, 0))
-
-    midi_events.sort(key=lambda item: (item[0], item[1]))
-    last_tick = 0
-    for tick, kind, note, velocity in midi_events:
-        delta = max(0, tick - last_tick)
-        msg_type = "note_on" if kind else "note_off"
-        track.append(mido.Message(msg_type, channel=DEFAULT_CHANNEL, note=note, velocity=velocity, time=delta))
-        last_tick = tick
-
-    track.append(mido.MetaMessage("end_of_track", time=0))
-    mid.save(midi_path)
-    return midi_path
+    return _write_seq_midi(sequence, sequence_id, GENERATED_DIR)
 
 
-def play_sequence_in_background(sequence_id: str) -> None:
-    def _run():
-        entry = _sequence_registry.get(sequence_id)
-        if not entry:
-            return
-        sequence = entry["sequence"]
-        seconds_per_beat = 60 / sequence["tempo_bpm"]
-        actions = []
-        for event in sequence["events"]:
-            start = event["at_beat"] * seconds_per_beat
-            end = (event["at_beat"] + event["duration_beats"]) * seconds_per_beat
-            for note in event["notes"]:
-                actions.append((start, 1, note, event["velocity"]))
-                actions.append((end, 0, note, 0))
-        actions.sort(key=lambda item: (item[0], item[1]))
-
-        with _currently_playing_lock:
-            _currently_playing.add(sequence_id)
-        try:
-            with _play_lock:
-                _stop_event.clear()
-                start_time = time.monotonic()
-                sounding = []
-                try:
-                    for action_time, kind, note, velocity in actions:
-                        if _stop_event.is_set():
-                            break
-                        sleep_for = start_time + action_time - time.monotonic()
-                        if sleep_for > 0:
-                            _stop_event.wait(sleep_for)
-                        if _stop_event.is_set():
-                            break
-                        if kind:
-                            _note_on(note, velocity, DEFAULT_CHANNEL)
-                            sounding.append(note)
-                        else:
-                            _note_off(note, DEFAULT_CHANNEL)
-                            if note in sounding:
-                                sounding.remove(note)
-                finally:
-                    for note in sounding:
-                        _note_off(note, DEFAULT_CHANNEL)
-        finally:
-            with _currently_playing_lock:
-                _currently_playing.discard(sequence_id)
-
-    threading.Thread(target=_run, daemon=True).start()
+def play_sequence_in_background(sequence_id: str, bars: str | None = None) -> None:
+    """Play a sequence by id. Looks up DB first, then falls back to in-memory registry."""
+    seq_dict = _resolve_sequence(sequence_id)
+    if seq_dict is None:
+        return
+    engine.play_sequence_bg(sequence_id, seq_dict, bars=bars)
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -906,7 +261,9 @@ def init_db():
 
 
 init_db()
+seq_model.init_model(DB_PATH)
 _play, _current_port, _note_on, _note_off = _init_player()
+engine.set_note_fns(_note_on, _note_off, _play, _current_port)
 
 
 def db_update_session_modified(session_id: str):
@@ -1087,6 +444,7 @@ def set_config(req: ConfigRequest):
 
     if req.port is None:
         _play, _current_port, _note_on, _note_off = _init_fluidsynth()
+        engine.set_note_fns(_note_on, _note_off, _play, None)
         db_set_setting("midi_out", None)
         return {"ok": True, "current": None}
 
@@ -1116,6 +474,7 @@ def set_config(req: ConfigRequest):
     _current_port = req.port
     _note_on = note_on
     _note_off = note_off
+    engine.set_note_fns(note_on, note_off, play, req.port)
     db_set_setting("midi_out", req.port)
     return {"ok": True, "current": req.port}
 
@@ -1276,18 +635,23 @@ def replay(note_id: str):
 
 @app.post("/sequence/{sequence_id}")
 def replay_sequence(sequence_id: str):
-    entry = _sequence_registry.get(sequence_id)
-    if not entry:
+    seq_dict = _resolve_sequence(sequence_id)
+    if seq_dict is None:
         raise HTTPException(404, "Sequence not found")
-    play_sequence_in_background(sequence_id)
+    engine.play_sequence_bg(sequence_id, seq_dict)
     return {"ok": True}
 
 
 @app.get("/sequence/{sequence_id}/download")
 def download_sequence(sequence_id: str):
-    entry = _sequence_registry.get(sequence_id)
-    midi_path = Path(entry["midi_path"]) if entry else GENERATED_DIR / f"{sequence_id}.mid"
-    if not midi_path.exists() or midi_path.parent != GENERATED_DIR:
+    # Try to regenerate MIDI from DB if the file is missing
+    midi_path = GENERATED_DIR / f"{sequence_id}.mid"
+    if not midi_path.exists():
+        seq_dict = _resolve_sequence(sequence_id)
+        if seq_dict is None:
+            raise HTTPException(404, "Sequence not found")
+        midi_path = write_sequence_midi(seq_dict, sequence_id)
+    if not midi_path.exists():
         raise HTTPException(404, "MIDI file not found")
     return FileResponse(midi_path, media_type="audio/midi", filename=f"{sequence_id}.mid")
 
@@ -1303,12 +667,16 @@ def play_single_midi(note: int):
 @app.get("/playing")
 def get_playing():
     with _currently_playing_lock:
-        return list(_currently_playing)
+        server_playing = set(_currently_playing)
+    with engine._currently_playing_lock:
+        engine_playing = set(engine._currently_playing)
+    return list(server_playing | engine_playing)
 
 
 @app.post("/stop")
 def stop_playback():
     _stop_event.set()
+    engine.stop()
     return {"ok": True}
 
 
@@ -1521,298 +889,24 @@ def chat_stream(req: ChatRequest):
 
             # Execute tools and emit pills inline
             tool_results = []
-            for tool in pending_tools:
-                if tool["name"] == "check_abc":
-                    inp = tool["input"]
-                    try:
-                        sequence = parse_abc(inp["abc"])
-                    except ABCParseError as e:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool["id"],
-                            "content": f"ABC parse error:\n{e}",
-                            "is_error": True,
-                        })
-                        continue
-                    normalized = to_abc(sequence)
-                    bar_msgs = per_bar_report(sequence)
-                    report_lines = [
-                        f"Title: {sequence['title']}",
-                        f"Tempo: {sequence['tempo_bpm']} bpm",
-                        f"Meter: {sequence['time_signature']}",
-                        f"Key: {sequence.get('key', 'C')}",
-                        f"Total: {sequence['total_beats']:.4g} beats ({sequence['duration_ms']}ms)",
-                        "",
-                        "Per-bar report:",
-                    ]
-                    report_lines += (bar_msgs if bar_msgs else ["  All bars correct."])
-                    report_lines += ["", "Normalized ABC:", normalized]
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool["id"],
-                        "content": "\n".join(report_lines),
-                    })
-                    continue
-
-                elif tool["name"] == "play_abc":
-                    inp = tool["input"]
-                    try:
-                        sequence = parse_abc(inp["abc"])
-                    except ABCParseError as e:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool["id"],
-                            "content": f"ABC parse error:\n{e}",
-                            "is_error": True,
-                        })
-                        continue
-
-                    sequence_id = str(uuid.uuid4())[:8]
-                    midi_path = write_sequence_midi(sequence, sequence_id)
-                    _sequence_registry[sequence_id] = {"sequence": sequence, "midi_path": midi_path}
-                    play_sequence_in_background(sequence_id)
-
-                    pill_id = f"p{str(uuid.uuid4())[:6]}"
-                    midi_url = f"/sequence/{sequence_id}/download"
-                    yield ds_merge_fragment(
-                        sequence_pill(sequence_id, sequence["title"], pill_id, sequence["duration_ms"], midi_url, sequence["events"]),
-                        selector=f"#{asst_msg_id} .bubble",
-                    )
-
-                    assistant_record.append({
-                        "type": "sequence",
-                        "sequence_id": sequence_id,
-                        "title": sequence["title"],
-                        "duration_ms": sequence["duration_ms"],
-                        "sequence": sequence,
-                        "midi_path": str(midi_path),
-                    })
-
-                    normalized = to_abc(sequence)
-                    bar_msgs = per_bar_report(sequence)
-                    report_lines = [
-                        f"Played: {sequence['title']}",
-                        f"Tempo: {sequence['tempo_bpm']} bpm  Meter: {sequence['time_signature']}  Key: {sequence.get('key', 'C')}",
-                        f"Total: {sequence['total_beats']:.4g} beats ({sequence['duration_ms']}ms)",
-                        "",
-                        "Per-bar report:",
-                    ]
-                    report_lines += (bar_msgs if bar_msgs else ["  All bars correct."])
-                    report_lines += ["", "Normalized ABC (what was stored):", normalized]
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool["id"],
-                        "content": "\n".join(report_lines),
-                    })
-                    continue
-
-                elif tool["name"] == "play_notes":
-                    inp = tool["input"]
-                    duration_ms = inp.get("duration_ms", DEFAULT_DURATION_MS)
-                    label = inp.get("label", "")
-                    try:
-                        root = inp["root"]
-                        quality = normalize_chord_quality(inp["quality"], root=root)
-                        notes = build_chord(root, quality, inp.get("octave", 4))
-                    except ValueError as e:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool["id"],
-                            "content": f"Error: {e}",
-                            "is_error": True,
-                        })
-                        continue
-
-                    octave = inp.get("octave", 4)
-                    spelled_names = chord_note_names(root, quality, octave)
-                    note_names_str = ", ".join(spelled_names)
-                    note_id = str(uuid.uuid4())[:8]
-                    _note_registry[note_id] = {
-                        "notes": notes,
-                        "duration_ms": duration_ms,
-                        "root": root,
-                        "quality": quality,
-                    }
-                    pill_id = f"p{str(uuid.uuid4())[:6]}"
-                    yield ds_merge_fragment(
-                        audio_pill(note_id, label, pill_id, notes, root, quality),
-                        selector=f"#{asst_msg_id} .bubble",
-                    )
-
-                    assistant_record.append({
-                        "type": "audio",
-                        "note_id": note_id,
-                        "notes": notes,
-                        "note_names": spelled_names,
-                        "duration_ms": duration_ms,
-                        "label": label,
-                        "root": root,
-                        "quality": quality,
-                    })
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool["id"],
-                        "content": f"Played {label or quality}: {note_names_str} (MIDI {', '.join(str(note) for note in notes)})",
-                    })
-                elif tool["name"] == "play_sequence":
-                    inp = tool["input"]
-                    try:
-                        sequence = build_sequence(inp)
-                    except (TypeError, ValueError) as e:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool["id"],
-                            "content": f"Error: {e}",
-                            "is_error": True,
-                        })
-                        continue
-
-                    sequence_id = str(uuid.uuid4())[:8]
-                    midi_path = write_sequence_midi(sequence, sequence_id)
-                    _sequence_registry[sequence_id] = {"sequence": sequence, "midi_path": midi_path}
-
-                    pill_id = f"p{str(uuid.uuid4())[:6]}"
-                    midi_url = f"/sequence/{sequence_id}/download"
-                    yield ds_merge_fragment(
-                        sequence_pill(sequence_id, sequence["title"], pill_id, sequence["duration_ms"], midi_url, sequence["events"]),
-                        selector=f"#{asst_msg_id} .bubble",
-                    )
-
-                    assistant_record.append({
-                        "type": "sequence",
-                        "sequence_id": sequence_id,
-                        "title": sequence["title"],
-                        "duration_ms": sequence["duration_ms"],
-                        "sequence": sequence,
-                        "midi_path": str(midi_path),
-                    })
-                    warnings = _sequence_warnings(sequence)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool["id"],
-                        "content": f"Created {sequence['title']} ({sequence['duration_ms']}ms). MIDI saved at {midi_path.name}\n\n{_sequence_report(sequence, warnings=warnings)}",
-                    })
-                elif tool["name"] == "play_melody":
-                    inp = tool["input"]
-                    try:
-                        sequence = build_melody(inp)
-                    except (TypeError, ValueError) as e:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool["id"],
-                            "content": f"Error: {e}",
-                            "is_error": True,
-                        })
-                        continue
-
-                    sequence_id = str(uuid.uuid4())[:8]
-                    midi_path = write_sequence_midi(sequence, sequence_id)
-                    _sequence_registry[sequence_id] = {"sequence": sequence, "midi_path": midi_path}
-
-                    pill_id = f"p{str(uuid.uuid4())[:6]}"
-                    midi_url = f"/sequence/{sequence_id}/download"
-                    yield ds_merge_fragment(
-                        sequence_pill(sequence_id, sequence["title"], pill_id, sequence["duration_ms"], midi_url, sequence["events"]),
-                        selector=f"#{asst_msg_id} .bubble",
-                    )
-
-                    assistant_record.append({
-                        "type": "sequence",
-                        "sequence_id": sequence_id,
-                        "title": sequence["title"],
-                        "duration_ms": sequence["duration_ms"],
-                        "sequence": sequence,
-                        "midi_path": str(midi_path),
-                    })
-                    warnings = _sequence_warnings(sequence, melody=True)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool["id"],
-                        "content": f"Created melody. MIDI saved at {midi_path.name}\n\n{_sequence_report(sequence, warnings=warnings)}",
-                    })
-                elif tool["name"] == "validate_sequence":
-                    inp = tool["input"]
-                    try:
-                        sequence = build_sequence(inp)
-                    except (TypeError, ValueError) as e:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool["id"],
-                            "content": f"Error: {e}",
-                            "is_error": True,
-                        })
-                        continue
-
-                    warnings = _sequence_warnings(sequence)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool["id"],
-                        "content": _sequence_report(sequence, warnings=warnings),
-                    })
-
-                elif tool["name"] == "search_corpus":
-                    from sequencer.midi_io import search_corpus as _search_corpus
-                    inp = tool["input"]
-                    query = inp.get("query", "")
-                    max_results = int(inp.get("max_results", 5))
-                    try:
-                        results = _search_corpus(query, max_results=max_results)
-                    except Exception as e:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool["id"],
-                            "content": f"Search error: {e}",
-                            "is_error": True,
-                        })
-                        continue
-                    if not results:
-                        content = f"No corpus results for {query!r}."
-                    else:
-                        lines = [f"Found {len(results)} result(s) for {query!r}:"]
-                        for i, r in enumerate(results, 1):
-                            comp = f" ({r['composer']})" if r['composer'] else ""
-                            lines.append(f"{i}. {r['title']}{comp} — corpus_path: {r['corpus_path']!r}")
-                        lines.append("\nUse import_corpus(corpus_path=...) to load one.")
-                        content = "\n".join(lines)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool["id"],
-                        "content": content,
-                    })
-
-                elif tool["name"] == "import_corpus":
-                    from sequencer.midi_io import load_corpus_entry
-                    from sequencer.abc import to_abc, per_bar_report
-                    inp = tool["input"]
-                    corpus_path = inp.get("corpus_path", "")
-                    try:
-                        sequence, dropped = load_corpus_entry(corpus_path)
-                    except Exception as e:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool["id"],
-                            "content": f"Import error: {e}",
-                            "is_error": True,
-                        })
-                        continue
-
-                    normalized = to_abc(sequence)
-                    bar_msgs = per_bar_report(sequence)
-                    lines = [
-                        f"Imported: {sequence['title']}",
-                        f"Tempo: {sequence['tempo_bpm']} bpm  Meter: {sequence['time_signature']}  Key: {sequence.get('key', 'C')}",
-                        f"Total: {sequence['total_beats']:.4g} beats ({sequence['duration_ms']}ms)",
-                    ]
-                    if dropped:
-                        lines += ["", f"Notes: {dropped}"]
-                    lines += ["", "Per-bar report:"]
-                    lines += (bar_msgs if bar_msgs else ["  All bars correct."])
-                    lines += ["", "Normalized ABC:", normalized]
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool["id"],
-                        "content": "\n".join(lines),
-                    })
+            for kind, payload in dispatch_tools(
+                pending_tools,
+                session_id=req.session_id,
+                asst_msg_id=asst_msg_id,
+                note_registry=_note_registry,
+                sequence_registry=_sequence_registry,
+                resolve_sequence=_resolve_sequence,
+                sequence_pill_fn=sequence_pill,
+                audio_pill_fn=audio_pill,
+                generated_dir=GENERATED_DIR,
+                play_notes_bg=play_in_background,
+            ):
+                if kind == "sse":
+                    yield ds_merge_fragment(payload, selector=f"#{asst_msg_id} .bubble")
+                elif kind == "result":
+                    tool_results.append(payload)
+                elif kind == "record":
+                    assistant_record.append(payload)
 
             current_history.append({"role": "user", "content": tool_results})
 

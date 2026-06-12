@@ -298,3 +298,8 @@ def _midi_to_name(midi: int, prefer_flats: bool = False) -> str:
     pc = midi % 12
     oct_ = midi // 12 - 1
     return f"{(flats if prefer_flats else sharps)[pc]}{oct_}"
+
+
+def midi_note_name(n: int, prefer_flats: bool = False) -> str:
+    """Public alias for _midi_to_name."""
+    return _midi_to_name(n, prefer_flats)
