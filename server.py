@@ -127,7 +127,12 @@ def _init_fluidsynth():
     sfid = fs.sfload(SOUNDFONT)
     if sfid == -1:
         raise RuntimeError(f"Could not load soundfont: {SOUNDFONT}")
-    fs.program_select(DEFAULT_CHANNEL, sfid, 0, DEFAULT_INSTRUMENT)
+    # Assign the soundfont to every melodic channel; without this, multi-voice
+    # playback on channels 1+ is silent (channels have no preset by default).
+    for ch in range(16):
+        if ch == 9:
+            continue  # percussion channel
+        fs.program_select(ch, sfid, 0, DEFAULT_INSTRUMENT)
     fs.set_reverb(roomsize=0.5, damping=0.3, width=0.8, level=0.7)
     fs.set_chorus(nr=4, level=0.55, speed=0.36, depth=3.6, type=0)
     print("Audio out: FluidSynth")
@@ -707,6 +712,7 @@ class RecordStopRequest(BaseModel):
     title: str = "Recording"
     grid: float = 0.25  # quantization grid in beats (0.25 = 1/16th)
     quantize: bool = True
+    auto_tempo: bool = True  # estimate tempo from the performance instead of using tempo_bpm
 
 
 @app.post("/record/start")
@@ -726,10 +732,15 @@ def record_stop(req: RecordStopRequest):
     if not raw_events:
         raise HTTPException(400, "No notes were recorded.")
 
+    tempo_bpm = req.tempo_bpm
+    if req.auto_tempo:
+        from sequencer.midi_io import estimate_tempo
+        tempo_bpm = estimate_tempo(raw_events)
+
     try:
         seq_dict = quantize_recording(
             raw_events,
-            tempo_bpm=req.tempo_bpm,
+            tempo_bpm=tempo_bpm,
             time_signature=req.time_signature,
             grid=req.grid,
         )
@@ -743,7 +754,7 @@ def record_stop(req: RecordStopRequest):
         title=req.title,
         abc=abc_text,
         session_id=req.session_id,
-        tempo_bpm=req.tempo_bpm,
+        tempo_bpm=tempo_bpm,
         time_signature=req.time_signature,
         source="recording",
         raw_events=raw_events,
@@ -776,6 +787,7 @@ def record_stop(req: RecordStopRequest):
     return {
         "ok": True,
         "sequence_id": seq_id,
+        "tempo_bpm": tempo_bpm,
         "abc": abc_text,
         "pill_html": pill_html,
         "timing_report": t_report,
@@ -918,7 +930,7 @@ def chat_stream(req: ChatRequest):
                     if p.get("type") == "sequence":
                         seq_summaries.append(
                             f"[Recording captured: id={p['sequence_id']}, title={p.get('title','Recording')}, "
-                            f"duration={p.get('duration_ms',0)//1000}s]"
+                            f"duration={p.get('duration_ms',0)//1000}s — call read_recording to see the exact notes]"
                         )
                 if seq_summaries:
                     api_parts = [{"type": "text", "text": "\n".join(seq_summaries)}] + api_parts

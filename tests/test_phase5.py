@@ -619,3 +619,46 @@ class TestEngineExpressive:
         if 67 in on_times and 69 in on_times:
             gap_g_to_a = on_times[69] - on_times[67]
             assert gap_g_to_a > 0.7, f"After [Q:60], inter-note gap should be ~1s, got {gap_g_to_a:.2f}s"
+
+
+# ── Regression: cross-bar durations, rest-padded voices, chord ties ───────────
+
+class TestRoundTripCrossBar:
+    def _note(self, at, dur, midi, name):
+        return {"at_beat": at, "duration_beats": dur, "notes": [midi], "note_names": [name],
+                "root": name[:-1], "quality": "note", "octave": int(name[-1]),
+                "velocity": 90, "label": name}
+
+    def test_cross_bar_durations_survive_round_trip(self):
+        # Mirrors a real recording where notes cross barlines; to_abc used to
+        # truncate them at the bar boundary instead of emitting ties.
+        events = [
+            self._note(0, 3, 60, "C4"), self._note(3, 3.25, 72, "C5"),
+            self._note(6.25, 2.5, 71, "B4"), self._note(8.75, 2, 67, "G4"),
+            self._note(10.75, 1, 69, "A4"), self._note(11.75, 2.25, 71, "B4"),
+            self._note(14.25, 3.75, 72, "C5"),
+        ]
+        seq = {"title": "Recording", "tempo_bpm": 88.0, "time_signature": "4/4",
+               "time_signature_parts": (4, 4), "key": "C", "events": events,
+               "total_beats": 18.0, "duration_ms": 0, "abc_errors": []}
+        reparsed = parse_abc(to_abc(seq))
+        got = [(e["at_beat"], e["duration_beats"], e["notes"][0]) for e in reparsed["events"]]
+        expected = [(e["at_beat"], e["duration_beats"], e["notes"][0]) for e in events]
+        assert got == expected
+
+    def test_chord_tie_merges_across_barline(self):
+        seq = parse_abc("X:1\nT:t\nM:4/4\nL:1/4\nK:C\n[CEG]2 [CEG]2-|[CEG]2 z2|\n")
+        assert [(e["at_beat"], e["duration_beats"]) for e in seq["events"]] == [(0.0, 2.0), (2.0, 4.0)]
+
+    def test_rest_padded_voice_counts_full_bars(self):
+        # Voice 2 ends in rest-only bars; bar accounting must include them
+        # rather than erroring "voice 2 has 3 bars".
+        abc = (
+            "X:1\nT:t\nM:4/4\nL:1/4\nQ:88\nK:Em\nV:1\nV:2\n"
+            "[V:1] C3 c|z9/4 B7/4|z3/4 G2 A B/4|z9/4 c7/4|\n"
+            "[V:2] z4|z3 [E^FA]|[B,^DF]4|z4|\n"
+        )
+        seq = parse_abc(abc)
+        assert [v["id"] for v in seq["voices"]] == ["1", "2"]
+        voice2_notes = [e for e in seq["events"] if e.get("voice") == "2"]
+        assert len(voice2_notes) == 2

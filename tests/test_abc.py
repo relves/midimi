@@ -28,42 +28,42 @@ def _seq_simple(title="Test", tempo=120, ts="4/4", key="C"):
 
 class TestOctaveConvention:
     def test_middle_c_lowercase(self):
-        """c (lowercase) = C4 = MIDI 60."""
+        """c (lowercase) = C5 = MIDI 72."""
         abc = "X:1\nT:test\nM:4/4\nL:1/4\nQ:120\nK:C\nc4 |"
+        seq = parse_abc(abc)
+        assert seq["events"][0]["notes"] == [72]
+        assert seq["events"][0]["note_names"] == ["C5"]
+
+    def test_uppercase_c_octave3(self):
+        """C (uppercase) = C4 = MIDI 60 (middle C)."""
+        abc = "X:1\nT:test\nM:4/4\nL:1/4\nQ:120\nK:C\nC4 |"
         seq = parse_abc(abc)
         assert seq["events"][0]["notes"] == [60]
         assert seq["events"][0]["note_names"] == ["C4"]
 
-    def test_uppercase_c_octave3(self):
-        """C (uppercase) = C3 = MIDI 48."""
-        abc = "X:1\nT:test\nM:4/4\nL:1/4\nQ:120\nK:C\nC4 |"
-        seq = parse_abc(abc)
-        assert seq["events"][0]["notes"] == [48]
-        assert seq["events"][0]["note_names"] == ["C3"]
-
     def test_octave_raise(self):
-        """c' = C5 = MIDI 72."""
+        """c' = C6 = MIDI 84."""
         abc = "X:1\nT:test\nM:4/4\nL:1/4\nQ:120\nK:C\nc'4 |"
         seq = parse_abc(abc)
-        assert seq["events"][0]["notes"] == [72]
+        assert seq["events"][0]["notes"] == [84]
 
     def test_octave_lower(self):
-        """C, = C2 = MIDI 36."""
+        """C, = C3 = MIDI 48."""
         abc = "X:1\nT:test\nM:4/4\nL:1/4\nQ:120\nK:C\nC,4 |"
         seq = parse_abc(abc)
-        assert seq["events"][0]["notes"] == [36]
+        assert seq["events"][0]["notes"] == [48]
 
     def test_accidental_sharp(self):
-        """^F in key C = F#4."""
+        """^f in key C = F#5."""
         abc = "X:1\nT:test\nM:4/4\nL:1/4\nQ:120\nK:C\n^f4 |"
         seq = parse_abc(abc)
-        assert seq["events"][0]["notes"] == [66]  # F#4
+        assert seq["events"][0]["notes"] == [78]  # F#5
 
     def test_accidental_flat(self):
-        """_b = Bb4 = MIDI 70."""
+        """_b = Bb5 = MIDI 82."""
         abc = "X:1\nT:test\nM:4/4\nL:1/4\nQ:120\nK:C\n_b4 |"
         seq = parse_abc(abc)
-        assert seq["events"][0]["notes"] == [70]  # Bb4
+        assert seq["events"][0]["notes"] == [82]  # Bb5
 
 
 # ── Key signature ─────────────────────────────────────────────────────────────
@@ -73,26 +73,26 @@ class TestKeySignature:
         """In G major, bare f → F#."""
         abc = "X:1\nT:test\nM:4/4\nL:1/4\nQ:120\nK:G\nf4 |"
         seq = parse_abc(abc)
-        assert seq["events"][0]["notes"] == [66]  # F#4
+        assert seq["events"][0]["notes"] == [78]  # F#5
 
     def test_natural_cancels_key_sig(self):
         """=f in G major → F natural."""
         abc = "X:1\nT:test\nM:4/4\nL:1/4\nQ:120\nK:G\n=f4 |"
         seq = parse_abc(abc)
-        assert seq["events"][0]["notes"] == [65]  # F4
+        assert seq["events"][0]["notes"] == [77]  # F5
 
     def test_bar_accidental_persists(self):
         """Accidental in bar persists to end of bar."""
         abc = "X:1\nT:test\nM:4/4\nL:1/4\nQ:120\nK:C\n^f f f f |"
         seq = parse_abc(abc)
-        assert all(e["notes"] == [66] for e in seq["events"])  # all F#4
+        assert all(e["notes"] == [78] for e in seq["events"])  # all F#5
 
     def test_bar_accidental_resets(self):
         """Accidental resets at barline."""
         abc = "X:1\nT:test\nM:4/4\nL:1/4\nQ:120\nK:C\n^f f f f | f4 |"
         seq = parse_abc(abc)
         # Bar 1: F# F# F# F#; bar 2: F natural
-        assert seq["events"][4]["notes"] == [65]  # F4
+        assert seq["events"][4]["notes"] == [77]  # F5
 
 
 # ── Duration ──────────────────────────────────────────────────────────────────
@@ -188,7 +188,7 @@ class TestBarAccounting:
 class TestChords:
     def test_chord_parsing(self):
         """[CEG] = C major chord."""
-        abc = "X:1\nT:test\nM:4/4\nL:1/4\nQ:120\nK:C\n[ceg]4 |"
+        abc = "X:1\nT:test\nM:4/4\nL:1/4\nQ:120\nK:C\n[CEG]4 |"
         seq = parse_abc(abc)
         assert seq["events"][0]["notes"] == [60, 64, 67]
 
@@ -259,8 +259,8 @@ M:4/4
 L:1/4
 Q:120
 K:C
-e e f g | g f e d | c c d e | e3/2 d/ d2 |
-e e f g | g f e d | c c d e | d3/2 c/ c2 |
+E E F G | G F E D | C C D E | E3/2 D/ D2 |
+E E F G | G F E D | C C D E | D3/2 C/ C2 |
 """
 
 # Expected MIDI note sequence for first 8 bars (pitch only, octave 4)

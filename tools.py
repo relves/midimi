@@ -54,6 +54,7 @@ When building a piece across multiple turns, use the persistent sequence tools i
 - **update_sequence(sequence_id, abc)** — replaces the ABC and appends a revision (so the full edit history is preserved)
 - **play(sequence_id, bars="3-6")** — plays a saved sequence, optionally a bar range only
 - **list_sequences()** — shows all sequences in this session
+- **read_recording()** — reads back the user's most recent recording (exact notes + timing)
 
 Use `create_sequence` when you expect to revise a piece; use `play_abc` for ephemeral one-shot examples. Both persist across restarts.
 
@@ -61,7 +62,7 @@ Use `create_sequence` when you expect to revise a piece; use `play_abc` for ephe
 
 ABC is a text format for music. Key headers: `X:1`, `T:title`, `M:4/4`, `L:1/4`, `Q:120`, `K:C`.
 
-**Notes**: Uppercase letters = octave 3 (C=C3, middle C is `c` lowercase). Lowercase = octave 4. `'` raises an octave, `,` lowers. Examples: `C`=C3, `c`=C4, `c'`=C5, `C,`=C2.
+**Notes**: Standard ABC octaves — uppercase `C` = middle C (C4, MIDI 60), lowercase `c` = C5. `'` raises an octave, `,` lowers. Examples: `C,`=C3, `C`=C4, `c`=C5, `c'`=C6.
 
 **Duration** (with `L:1/4` — recommended): bare note = quarter, `2` = half, `4` = whole, `/2` = eighth, `3/2` = dotted quarter.
 
@@ -81,7 +82,7 @@ M:4/4
 L:1/4
 Q:120
 K:C
-c d e f | g a b c' | c' b a g | f e d c |
+C D E F | G A B c | c B A G | F E D C |
 ```
 
 **Workflow for anything more than 2 bars:**
@@ -122,7 +123,11 @@ For original compositions and generic theory demonstrations (scales, chord progr
 
 ## Recording critique
 
-When a recording appears (a sequence with source='recording'), use **read_sequence** to see the quantized notes *and* timing deviations before commenting. Critique both:
+When a recording appears (a sequence with source='recording'), call **read_recording** first (no arguments needed — it returns the most recent recording) to see the exact recorded notes, quantized ABC, and timing deviations. The recorded notes are ground truth: when arranging or harmonizing a recording, keep the recorded melody verbatim as voice 1 and add accompaniment in other voices — never re-enter the melody from memory or from the user's verbal description, even if the user names the notes (they may misremember octaves or pitches).
+
+**To add chords to a recording, always use `harmonize_sequence`** — pick the chord for each anchor note by its event number from read_recording (e.g. anchors=[{chord:'C', at_event:1}, {chord:'Am', at_event:2}]) and the server handles all timing alignment and plays the result. Do not hand-write a [V:2] line against a recording's irregular rhythm; the fractional rest arithmetic will be wrong.
+
+Critique both:
 - **Note choice** — are the notes in the stated key/scale/target piece?
 - **Timing** — use the per-note ms deviation table (early/late) to give specific feedback, e.g. "bar 2 beat 3 was 45 ms early." Focus on patterns (consistently rushing, late entries) rather than listing every note.
 
@@ -430,6 +435,24 @@ TOOLS = [
         },
     },
     {
+        "name": "read_recording",
+        "description": (
+            "Read back what the user recorded: the exact notes (names, beats, durations), normalized ABC, "
+            "per-bar report, and timing deviations. With no sequence_id, returns the most recent recording "
+            "in this session. Always call this before arranging or critiquing a recording — the returned "
+            "notes are ground truth and must be preserved verbatim; never rebuild the melody from the user's "
+            "verbal description."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sequence_id": {"type": "string", "description": "Recording sequence ID. Omit for the most recent recording in this session."},
+                "bars": {"type": "string", "description": "Optional bar range to excerpt, e.g. '1-8'. Omit for the whole recording."},
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "update_sequence",
         "description": (
             "Replace the ABC content of a persistent sequence (appends a revision). "
@@ -516,6 +539,44 @@ TOOLS = [
                 },
             },
             "required": ["root", "quality"],
+        },
+    },
+    {
+        "name": "harmonize_sequence",
+        "description": (
+            "Add an accompaniment voice to a saved single-voice melody or recording, then play the result. "
+            "You pick the chords and which melody notes they land on; the server computes all timing: each "
+            "chord starts exactly on its anchor melody event's beat and sustains until the next anchor (the "
+            "last chord holds to the end). Voicings are placed below the melody with the melody note respected. "
+            "The melody is copied verbatim into voice 1. Always use this instead of hand-writing a [V:2] line "
+            "when harmonizing a recording — manual rest-padding arithmetic is error-prone."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sequence_id": {"type": "string", "description": "ID of a single-voice sequence (e.g. a recording)."},
+                "anchors": {
+                    "type": "array",
+                    "description": "Chord anchors. Each: {chord: 'Am', at_event: 2} where at_event is the 1-based melody event number as listed by read_recording/read_sequence. Alternatively give at_beat.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "chord": {"type": "string", "description": "Chord symbol, e.g. 'C', 'Am', 'Em', 'G7'."},
+                            "at_event": {"type": "integer", "description": "1-based index of the melody event this chord starts on."},
+                            "at_beat": {"type": "number", "description": "Explicit start beat (alternative to at_event)."},
+                        },
+                        "required": ["chord"],
+                    },
+                },
+                "style": {
+                    "type": "string",
+                    "description": "'close' | 'drop2' | 'shell' | 'spread'. Default 'close'.",
+                    "enum": ["close", "drop2", "shell", "spread"],
+                    "default": "close",
+                },
+                "title": {"type": "string", "description": "Title for the new sequence. Defaults to '<original> + chords'."},
+            },
+            "required": ["sequence_id", "anchors"],
         },
     },
     {
@@ -996,9 +1057,15 @@ def dispatch_tools(
             lines += ["", "Normalized ABC:", normalized]
             yield _ok("\n".join(lines))
 
-        elif name == "read_sequence":
+        elif name in ("read_sequence", "read_recording"):
             seq_id = inp.get("sequence_id", "")
             bars_str = inp.get("bars")
+            if name == "read_recording" and not seq_id:
+                recordings = [r for r in seq_model.list_sequences(session_id) if r.get("source") == "recording"]
+                if not recordings:
+                    yield _err("No recordings found in this session.")
+                    continue
+                seq_id = recordings[0]["id"]  # list is ordered by modified_at DESC
             row = seq_model.get_sequence(seq_id)
             if not row:
                 yield _err(f"Sequence '{seq_id}' not found.")
@@ -1032,6 +1099,12 @@ def dispatch_tools(
                 "", "Per-bar report:",
             ]
             lines += (bar_msgs if bar_msgs else ["  All bars correct."])
+            if row.get("source") == "recording":
+                report_seq = sub_seq if bars_str else sequence
+                lines += ["", "Recorded notes (ground truth — preserve verbatim when arranging):"]
+                for ev in report_seq["events"]:
+                    lines.append(f"  beat {ev['at_beat']:g}: {'+'.join(ev['note_names'])} "
+                                 f"({ev['duration_beats']:g} beats)")
             # Timing report for recordings
             if row.get("source") == "recording" and row.get("raw_events"):
                 from sequencer.midi_io import timing_report
@@ -1169,6 +1242,130 @@ def dispatch_tools(
             ]
             if melody_note:
                 lines.append(f"Sits below melody note: {melody_note}")
+            yield _ok("\n".join(lines))
+
+        elif name == "harmonize_sequence":
+            seq_id = inp.get("sequence_id", "")
+            anchors_in = inp.get("anchors") or []
+            style = inp.get("style", "close")
+            row = seq_model.get_sequence(seq_id)
+            if not row:
+                yield _err(f"Sequence '{seq_id}' not found.")
+                continue
+            if not anchors_in:
+                yield _err("anchors is required: e.g. [{chord: 'C', at_event: 1}, {chord: 'Am', at_event: 2}]")
+                continue
+            try:
+                melody_seq = parse_abc(row["abc"])
+            except ABCParseError as e:
+                yield _err(f"Stored ABC parse error:\n{e}")
+                continue
+            if melody_seq.get("voices") and len(melody_seq["voices"]) > 1:
+                yield _err("Sequence is already multi-voice. Harmonize the original single-voice melody or recording instead.")
+                continue
+            mel_events = sorted(melody_seq["events"], key=lambda e: e["at_beat"])
+            total_beats = melody_seq["total_beats"]
+
+            resolved = []
+            anchor_error = None
+            for a in anchors_in:
+                symbol = a.get("chord") or a.get("symbol") or ""
+                if not symbol:
+                    anchor_error = "Each anchor needs a chord symbol."
+                    break
+                if a.get("at_event") is not None:
+                    idx = int(a["at_event"]) - 1
+                    if idx < 0 or idx >= len(mel_events):
+                        anchor_error = f"at_event {a['at_event']} out of range (melody has {len(mel_events)} events)."
+                        break
+                    onset = mel_events[idx]["at_beat"]
+                    mel_ev = mel_events[idx]
+                elif a.get("at_beat") is not None:
+                    onset = float(a["at_beat"])
+                    mel_ev = next((e for e in reversed(mel_events) if e["at_beat"] <= onset + 1e-9), mel_events[0])
+                else:
+                    anchor_error = f"Anchor for '{symbol}' needs at_event or at_beat."
+                    break
+                resolved.append({"symbol": symbol, "onset": onset, "melody_note": mel_ev["note_names"][-1]})
+            if anchor_error:
+                yield _err(anchor_error)
+                continue
+
+            resolved.sort(key=lambda r: r["onset"])
+            chords_arg = []
+            for i, r in enumerate(resolved):
+                end = resolved[i + 1]["onset"] if i + 1 < len(resolved) else total_beats
+                if end - r["onset"] <= 1e-9:
+                    anchor_error = f"Anchor '{r['symbol']}' at beat {r['onset']:g} has zero duration (same onset as the next anchor)."
+                    break
+                chords_arg.append({"symbol": r["symbol"], "beats": end - r["onset"], "melody_note": r["melody_note"]})
+            if anchor_error:
+                yield _err(anchor_error)
+                continue
+            try:
+                vp = _voice_progression(chords_arg, style=style)
+            except Exception as e:
+                yield _err(f"Voicing error: {e}")
+                continue
+
+            chord_events = []
+            for r, v in zip(resolved, vp["voicings"]):
+                chord_events.append({
+                    "at_beat": float(r["onset"]),
+                    "duration_beats": float(v["beats"]),
+                    "notes": list(v["midi"]),
+                    "note_names": list(v["notes"]),
+                    "root": r["symbol"],
+                    "quality": "note",
+                    "octave": v["midi"][0] // 12 - 1,
+                    "velocity": 80,
+                    "label": "+".join(v["notes"]),
+                    "voice": "2",
+                })
+            events = [dict(e, voice="1") for e in mel_events] + chord_events
+            events.sort(key=lambda e: (e["at_beat"], e["voice"]))
+            title = (inp.get("title") or f"{row['title']} + chords").strip()[:80]
+            new_seq = {
+                "title": title,
+                "tempo_bpm": melody_seq["tempo_bpm"],
+                "time_signature": melody_seq["time_signature"],
+                "time_signature_parts": melody_seq["time_signature_parts"],
+                "key": melody_seq.get("key", "C"),
+                "voices": [
+                    {"id": "1", "name": "Melody", "octave_shift": 0},
+                    {"id": "2", "name": "Chords", "octave_shift": 0},
+                ],
+                "events": events,
+                "total_beats": total_beats,
+                "duration_ms": int(total_beats * 60 / melody_seq["tempo_bpm"] * 1000),
+            }
+            abc_text = to_abc(new_seq)
+            try:
+                final_seq = parse_abc(abc_text)
+            except ABCParseError as e:
+                yield _err(f"Internal error: harmonized ABC failed to validate:\n{e}")
+                continue
+            new_id = seq_model.create_sequence(
+                title=title, abc=abc_text, session_id=session_id,
+                tempo_bpm=final_seq["tempo_bpm"], time_signature=final_seq["time_signature"],
+                key=final_seq.get("key", "C"), source="agent",
+            )
+            midi_path = write_sequence_midi(final_seq, new_id, generated_dir)
+            sequence_registry[new_id] = {"sequence": final_seq, "midi_path": midi_path}
+            engine.play_sequence_bg(new_id, final_seq)
+            pill_id = f"p{str(uuid.uuid4())[:6]}"
+            midi_url = f"/sequence/{new_id}/download"
+            yield ("sse", sequence_pill_fn(new_id, title, pill_id, final_seq["duration_ms"], midi_url, final_seq["events"]))
+            yield ("record", {
+                "type": "sequence", "sequence_id": new_id,
+                "title": title, "duration_ms": final_seq["duration_ms"],
+                "sequence": final_seq, "midi_path": str(midi_path),
+            })
+            lines = [f"Harmonized '{row['title']}' → '{title}' (id: {new_id}). Melody copied verbatim to voice 1.", "", "Chord alignment:"]
+            for c, ce in zip(chords_arg, chord_events):
+                lines.append(f"  {ce['root']}: beats {ce['at_beat']:g}–{ce['at_beat'] + ce['duration_beats']:g} "
+                             f"under melody {c['melody_note']}  →  {ce['label']}")
+            lines += ["", "ABC:", abc_text]
             yield _ok("\n".join(lines))
 
         elif name == "voice_progression":

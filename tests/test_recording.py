@@ -126,6 +126,58 @@ class TestQuantizeBasic:
         assert seq["raw_events"] is evs
 
 
+class TestQuantizeLegato:
+    def test_overlap_clipped_to_next_onset(self):
+        """Legato overlap (release after next onset) is clipped so events never overlap."""
+        bpm = 120.0
+        spb = _beats_to_sec(1, bpm)
+        evs = _make_events([
+            (60, 0.0, spb * 3.0),       # held 3 beats...
+            (72, spb * 2.75, spb * 6.0),  # ...but next note starts at 2.75
+        ], bpm)
+        seq = quantize_recording(evs, tempo_bpm=bpm, grid=0.25)
+        e0, e1 = seq["events"]
+        assert e0["at_beat"] + e0["duration_beats"] <= e1["at_beat"] + 1e-9
+
+    def test_legato_recording_roundtrips_through_abc(self):
+        """A legato recording must serialize to bar-valid ABC that re-parses."""
+        from sequencer.abc import parse_abc, to_abc
+        bpm = 120.0
+        spb = _beats_to_sec(1, bpm)
+        evs = _make_events([
+            (60, 0.0, spb * 3.0),
+            (72, spb * 2.75, spb * 6.0),
+            (71, spb * 6.0, spb * 7.5),
+            (67, spb * 7.25, spb * 8.25),
+        ], bpm)
+        seq = quantize_recording(evs, tempo_bpm=bpm, grid=0.25)
+        reparsed = parse_abc(to_abc(seq))  # raises ABCParseError on invalid bars
+        assert [e["notes"] for e in reparsed["events"]] == [[60], [72], [71], [67]]
+
+
+class TestEstimateTempo:
+    def test_steady_quarters_at_72(self):
+        from sequencer.midi_io import estimate_tempo
+        spb = 60.0 / 72.0
+        evs = _make_events([(60 + i, i * spb, (i + 0.9) * spb) for i in range(8)], 72.0)
+        bpm = estimate_tempo(evs)
+        assert 60 <= bpm <= 90  # quarter=72 is also consistent with eighths at 144; prior keeps it moderate
+
+    def test_mixed_simple_rhythm(self):
+        """Halves and quarters at 100 bpm estimate close to 100."""
+        from sequencer.midi_io import estimate_tempo
+        spb = 60.0 / 100.0
+        beats = [0, 2, 4, 5, 6, 8, 10, 11]
+        evs = _make_events([(60, b * spb, (b + 0.9) * spb) for b in beats], 100.0)
+        bpm = estimate_tempo(evs)
+        assert abs(bpm - 100) <= 5 or abs(bpm - 50) <= 3
+
+    def test_too_few_notes_defaults(self):
+        from sequencer.midi_io import estimate_tempo
+        evs = _make_events([(60, 0.0, 0.5)], 120.0)
+        assert estimate_tempo(evs) == 120.0
+
+
 class TestQuantizeSwing:
     def test_swing_eighth_still_quantizes(self):
         """Swung eighth notes (2/3, 1/3 of a beat) should snap to nearest 1/16."""

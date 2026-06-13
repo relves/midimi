@@ -352,14 +352,14 @@ def _midi_to_abc_token(midi: int, name: str) -> str:
         letter = m.group(1)
         acc_str = (m.group(2) or '').replace('#', '^').replace('b', '_')
         octave = int(m.group(3))
-    if octave == 3:
+    if octave == 4:
         return f"{acc_str}{letter.upper()}"
-    elif octave == 4:
+    elif octave == 5:
         return f"{acc_str}{letter.lower()}"
-    elif octave > 4:
-        return f"{acc_str}{letter.lower()}{''.join([chr(39)] * (octave - 4))}"
+    elif octave > 5:
+        return f"{acc_str}{letter.lower()}{''.join([chr(39)] * (octave - 5))}"
     else:
-        return f"{acc_str}{letter.upper()}{',' * (3 - octave)}"
+        return f"{acc_str}{letter.upper()}{',' * (4 - octave)}"
 
 
 def _place_close(pcs: list[int], bottom_midi: int) -> list[int]:

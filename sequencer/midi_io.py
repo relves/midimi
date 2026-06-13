@@ -391,6 +391,40 @@ def write_sequence_midi(
 
 # ── Recording quantizer ───────────────────────────────────────────────────────
 
+# Candidate note durations (beats) with complexity penalties: simpler = cheaper.
+_TEMPO_DURATIONS = {0.5: 0.0, 1.0: 0.0, 2.0: 0.0, 4.0: 0.0, 1.5: 0.01, 3.0: 0.02,
+                    0.75: 0.03, 0.25: 0.04, 1.25: 0.05, 2.5: 0.05}
+
+
+def estimate_tempo(raw_events: list[dict], lo: float = 50.0, hi: float = 160.0) -> float:
+    """Estimate the performed tempo from raw capture events.
+
+    Scores candidate tempos by how closely inter-onset intervals land on simple
+    note durations (weighted by interval length, so long notes dominate), with a
+    mild prior toward moderate tempos to resolve halving/doubling ambiguity.
+    Returns the tempo in bpm, or 120.0 if there are too few onsets to estimate.
+    """
+    import math
+
+    onsets = sorted(ev["t"] for ev in raw_events
+                    if ev.get("on", True) and ev.get("velocity", 1) > 0)
+    iois = [b - a for a, b in zip(onsets, onsets[1:]) if b - a > 1e-3]
+    if len(iois) < 2:
+        return 120.0
+
+    def score(bpm: float) -> float:
+        spb = 60.0 / bpm
+        total = sum(
+            min(abs(ioi / spb - d) / max(ioi / spb, 1e-9) + pen
+                for d, pen in _TEMPO_DURATIONS.items()) * ioi
+            for ioi in iois
+        )
+        return total / sum(iois) + 0.02 * abs(math.log2(bpm / 90.0))
+
+    best = min((score(b / 2), b / 2) for b in range(int(lo * 2), int(hi * 2) + 1))
+    return round(best[1])
+
+
 def quantize_recording(
     raw_events: list[dict],
     tempo_bpm: float = 120.0,
@@ -486,6 +520,14 @@ def quantize_recording(
 
     if not events:
         raise ValueError("Quantization produced no events")
+
+    # Clip overlaps: legato playing releases a note after the next one starts.
+    # Truncate at the next onset so serialized bars stay beat-valid.
+    events.sort(key=lambda e: e["at_beat"])
+    for cur, nxt in zip(events, events[1:]):
+        gap = nxt["at_beat"] - cur["at_beat"]
+        if cur["duration_beats"] > gap:
+            cur["duration_beats"] = gap
 
     total_beats = max(e["at_beat"] + e["duration_beats"] for e in events)
     duration_ms = int(total_beats * sec_per_beat * 1000)

@@ -16,8 +16,8 @@ Supported subset:
 Rejects tokens outside this subset with a bar/token-precise error message.
 
 Octave convention (standard ABC):
-  Uppercase letter = base octave 3 (C = C3 = MIDI 48)
-  Lowercase letter = base octave 4 (c = C4 = MIDI 60 = middle C)
+  Uppercase letter = base octave 4 (C = C4 = MIDI 60 = middle C)
+  Lowercase letter = base octave 5 (c = C5 = MIDI 72)
   ' raises by one octave, , lowers by one octave
 
 Multi-voice (Phase 5):
@@ -36,8 +36,8 @@ _LETTER_PC: dict[str, int] = {
     'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11,
 }
 
-# ABC octave base: uppercase = octave 3, lowercase = octave 4
-_BASE_OCTAVE = {'upper': 3, 'lower': 4}
+# ABC octave base (standard): uppercase = octave 4 (middle C), lowercase = octave 5
+_BASE_OCTAVE = {'upper': 4, 'lower': 5}
 
 # Sharp/flat names for MIDI → note name
 _SHARP_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
@@ -511,8 +511,10 @@ def _parse_body_to_events(
     key_sig: dict[str, int],
     beats_per_bar: Fraction,
     time_signature: str,
-) -> tuple[list[dict], list[str]]:
-    """Parse a single-voice ABC body string → (events, errors).
+) -> tuple[list[dict], list[str], float]:
+    """Parse a single-voice ABC body string → (events, errors, total_beats).
+
+    total_beats includes trailing rests (elapsed beats, not just last event end).
 
     This is the core event-builder, extracted so multi-voice parse can call it
     per-voice.  All existing logic is preserved exactly.
@@ -693,6 +695,19 @@ def _parse_body_to_events(
 
             bar_accidentals.update(chord_bar_acc)
 
+            if tie_active and all(m in tie_pending for m in chord_midis):
+                prev_idxs = {tie_pending[m] for m in chord_midis}
+                if len(prev_idxs) == 1:
+                    prev_idx = prev_idxs.pop()
+                    if prev_idx < len(events) and sorted(events[prev_idx]['notes']) == sorted(chord_midis):
+                        events[prev_idx]['duration_beats'] += float(dur)
+                        tie_pending = {m: prev_idx for m in chord_midis}
+                        tie_active = False
+                        at_beat += dur
+                        beat_in_bar += dur
+                        continue
+            tie_active = False
+
             octave = chord_midis[0] // 12 - 1
             evt = {
                 'at_beat': float(at_beat),
@@ -708,11 +723,11 @@ def _parse_body_to_events(
             if pending_decs:
                 running_velocity, _ = _apply_decorations(evt, pending_decs, running_velocity, bar_num, errors)
                 pending_decs = []
+            evt_idx = len(events)
             events.append(evt)
             at_beat += dur
             beat_in_bar += dur
-            tie_pending = {}
-            tie_active = False
+            tie_pending = {m: evt_idx for m in chord_midis}
             continue
 
     # Final bar check (if no trailing barline)
@@ -726,7 +741,7 @@ def _parse_body_to_events(
     for evt in events:
         evt.pop('_tied', None)
 
-    return events, errors
+    return events, errors, float(at_beat)
 
 
 # ── Multi-voice helpers ───────────────────────────────────────────────────────
@@ -906,7 +921,7 @@ def parse_abc(text: str) -> dict:
     if not is_multivoice:
         # ── Single-voice path (unchanged) ────────────────────────────────────
         body = '\n'.join(body_lines)
-        events, errors = _parse_body_to_events(body, unit_length, key_sig, beats_per_bar, time_signature)
+        events, errors, _ = _parse_body_to_events(body, unit_length, key_sig, beats_per_bar, time_signature)
 
         if errors:
             raise ABCParseError('\n'.join(errors))
@@ -947,7 +962,7 @@ def parse_abc(text: str) -> dict:
         vid = v['id']
         vname = v.get('name', vid)
         vbody = '\n'.join(voice_bodies.get(vid, []))
-        evts, errs = _parse_body_to_events(vbody, unit_length, key_sig, beats_per_bar, time_signature)
+        evts, errs, vbeats = _parse_body_to_events(vbody, unit_length, key_sig, beats_per_bar, time_signature)
 
         # Apply octave shift (from octave= attribute)
         if v.get('octave_shift', 0):
@@ -959,9 +974,8 @@ def parse_abc(text: str) -> dict:
             e['voice'] = vid
         all_events.extend(evts)
         all_errors.extend([f"voice {vname}, {err}" for err in errs])
-        voice_beat_totals[vid] = max(
-            (e['at_beat'] + e['duration_beats'] for e in evts), default=0.0
-        )
+        # Elapsed beats including trailing rests, so rest-padded voices count fully
+        voice_beat_totals[vid] = vbeats
 
     # Voice bar count mismatch → error
     if len(voice_beat_totals) > 1:
@@ -1123,18 +1137,18 @@ def _midi_to_abc_note(midi: int, note_name: str | None = None) -> str:
 
     abc_acc = acc.replace('#', '^').replace('b', '_')
 
-    if octave == 3:
+    if octave == 4:
         abc_letter = letter.upper()
         oct_marks = ''
-    elif octave == 4:
+    elif octave == 5:
         abc_letter = letter.lower()
         oct_marks = ''
-    elif octave > 4:
+    elif octave > 5:
         abc_letter = letter.lower()
-        oct_marks = "'" * (octave - 4)
+        oct_marks = "'" * (octave - 5)
     else:
         abc_letter = letter.upper()
-        oct_marks = ',' * (3 - octave)
+        oct_marks = ',' * (4 - octave)
 
     return f"{abc_acc}{abc_letter}{oct_marks}"
 
@@ -1173,6 +1187,37 @@ def _event_prefix(e: dict) -> str:
     return ''.join(parts)
 
 
+def _split_events_at_bars(events: list[dict], beats_per_bar: float) -> list[dict]:
+    """Split events that cross barlines into per-bar segments joined by ties.
+
+    Each segment except the last carries '_tie': True so the renderer can emit
+    the '-' tie token, preserving the full written duration across barlines.
+    """
+    out: list[dict] = []
+    for e in events:
+        if e.get('quality') == 'tempo_change' or not e.get('notes'):
+            out.append(e)
+            continue
+        start = e['at_beat']
+        end = start + e['duration_beats']
+        bar_end = (int(start / beats_per_bar + 1e-9) + 1) * beats_per_bar
+        if end <= bar_end + 1e-6:
+            out.append(e)
+            continue
+        cur = start
+        while cur < end - 1e-6:
+            seg_end = min(end, bar_end)
+            seg = dict(e)
+            seg['at_beat'] = cur
+            seg['duration_beats'] = seg_end - cur
+            if seg_end < end - 1e-6:
+                seg['_tie'] = True
+            out.append(seg)
+            cur = seg_end
+            bar_end += beats_per_bar
+    return out
+
+
 def _render_bar_events(bar_evts: list[dict], bar_start: float, bar_end: float) -> str:
     """Render a list of events within a bar to an ABC token string."""
     bar_tokens: list[str] = []
@@ -1194,12 +1239,13 @@ def _render_bar_events(bar_evts: list[dict], bar_start: float, bar_end: float) -
         capped_dur = min(e['duration_beats'], bar_end - e['at_beat'])
         if capped_dur <= 0:
             continue
+        tie = '-' if e.get('_tie') else ''
         if len(e['notes']) == 1:
             note_names = e.get('note_names') or []
             nn = note_names[0] if note_names else None
             abc_note = _midi_to_abc_note(e['notes'][0], nn)
             dur = _duration_to_abc(capped_dur)
-            bar_tokens.append(f"{prefix}{abc_note}{dur}")
+            bar_tokens.append(f"{prefix}{abc_note}{dur}{tie}")
         elif len(e['notes']) > 1:
             note_names = e.get('note_names') or []
             chord_parts = []
@@ -1207,7 +1253,7 @@ def _render_bar_events(bar_evts: list[dict], bar_start: float, bar_end: float) -
                 nn = note_names[i] if i < len(note_names) else None
                 chord_parts.append(_midi_to_abc_note(midi, nn))
             dur = _duration_to_abc(capped_dur)
-            bar_tokens.append(f"{prefix}[{''.join(chord_parts)}]{dur}")
+            bar_tokens.append(f"{prefix}[{''.join(chord_parts)}]{dur}{tie}")
         prev_end = e['at_beat'] + e['duration_beats']
 
     trailing = bar_end - prev_end
@@ -1252,6 +1298,7 @@ def _to_abc_single(sequence: dict) -> str:
     if not events:
         lines.append('')
         return '\n'.join(lines)
+    events = _split_events_at_bars(events, beats_per_bar)
 
     total_beats = sequence.get('total_beats', 0.0)
     n_bars = int(total_beats / beats_per_bar) + (1 if total_beats % beats_per_bar > 1e-6 else 0)
@@ -1314,6 +1361,7 @@ def _to_abc_multi(sequence: dict) -> str:
             events_by_voice[vid].append(e)
     for vid in events_by_voice:
         events_by_voice[vid].sort(key=lambda e: e['at_beat'])
+        events_by_voice[vid] = _split_events_at_bars(events_by_voice[vid], beats_per_bar)
 
     total_beats = sequence.get('total_beats', 0.0)
     n_bars = int(total_beats / beats_per_bar) + (1 if total_beats % beats_per_bar > 1e-6 else 0)

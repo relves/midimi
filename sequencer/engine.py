@@ -214,7 +214,12 @@ def _init_fluidsynth() -> None:
     sfid = fs.sfload(SOUNDFONT)
     if sfid == -1:
         raise RuntimeError(f"Could not load soundfont: {SOUNDFONT}")
-    fs.program_select(DEFAULT_CHANNEL, sfid, 0, DEFAULT_INSTRUMENT)
+    # Assign the soundfont to every melodic channel; without this, multi-voice
+    # playback on channels 1+ is silent (channels have no preset by default).
+    for ch in range(16):
+        if ch == 9:
+            continue  # percussion channel
+        fs.program_select(ch, sfid, 0, DEFAULT_INSTRUMENT)
     fs.set_reverb(roomsize=0.5, damping=0.3, width=0.8, level=0.7)
     fs.set_chorus(nr=4, level=0.55, speed=0.36, depth=3.6, type=0)
     print("Audio out: FluidSynth")
