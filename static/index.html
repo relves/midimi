@@ -189,6 +189,107 @@
       padding: 20px 12px;
     }
 
+    /* ── Daily Scale Patch ── */
+    #drill-entry {
+      margin: 0 12px 8px;
+      padding: 10px 12px;
+      background: var(--surface);
+      border: 1px solid var(--accent-dim);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-shrink: 0;
+      transition: background 0.12s, border-color 0.12s;
+    }
+    #drill-entry:hover { background: var(--surface2); border-color: var(--accent); }
+    #drill-entry.active { border-color: var(--accent); background: var(--surface2); }
+    #drill-badge {
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 10px;
+      background: var(--accent);
+      color: #fff;
+      white-space: nowrap;
+    }
+    #drill-badge.done { background: transparent; color: #f0a040; }
+
+    #drill-panel {
+      flex: 1;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      overflow-y: auto;
+    }
+    #drill-panel.open { display: flex; }
+    .drill-card {
+      width: 100%;
+      max-width: 520px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 28px;
+      text-align: center;
+    }
+    .drill-prompt { font-size: 1.6rem; font-weight: 700; margin-bottom: 6px; }
+    .drill-sub { color: var(--text-dim); font-size: 0.82rem; margin-bottom: 20px; }
+    #drill-answer {
+      width: 100%;
+      padding: 12px 14px;
+      font-size: 1.1rem;
+      letter-spacing: 0.04em;
+      text-align: center;
+      background: var(--surface);
+      border: 1px solid var(--accent-dim);
+      border-radius: 8px;
+      color: var(--text);
+      box-sizing: border-box;
+    }
+    #drill-answer:focus { outline: none; border-color: var(--accent); }
+    .drill-btn {
+      margin-top: 16px;
+      padding: 10px 20px;
+      background: var(--accent);
+      border: none;
+      border-radius: 8px;
+      color: #fff;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .drill-btn:hover { background: #9b8dff; }
+    .drill-btn.secondary { background: var(--surface); border: 1px solid var(--border); color: var(--text); }
+    .drill-result { margin-top: 22px; }
+    .drill-notes { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin: 14px 0; }
+    .drill-note {
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 0.95rem;
+      border: 1px solid var(--border);
+    }
+    .drill-note.ok { background: rgba(80,200,120,0.15); border-color: #50c878; color: #7fe0a0; }
+    .drill-note.bad { background: rgba(224,112,112,0.15); border-color: #e07070; color: #f0a0a0; }
+    .drill-verdict { font-size: 1.15rem; font-weight: 700; margin-bottom: 6px; }
+    .drill-verdict.correct { color: #7fe0a0; }
+    .drill-verdict.incorrect { color: #f0a0a0; }
+    .drill-done { text-align: center; }
+    .drill-done .big { font-size: 1.4rem; font-weight: 700; margin-bottom: 8px; }
+    #drill-close {
+      align-self: flex-start;
+      background: none; border: none; color: var(--text-dim);
+      cursor: pointer; font-size: 0.85rem; margin-bottom: 12px;
+    }
+    #drill-close:hover { color: var(--text); }
+
     #chat-area {
       flex: 1;
       display: flex;
@@ -774,10 +875,19 @@
     <div id="sidebar">
       <div id="sidebar-inner">
         <button id="new-chat-btn" onclick="startNewSession()">+ New chat</button>
+        <button id="drill-entry" onclick="openDrill()" title="Daily scale-spelling drill">
+          <span>🎯 Daily Scale Patch</span>
+          <span id="drill-badge">…</span>
+        </button>
         <div id="sessions-list">
           <div id="sessions-empty">No sessions yet</div>
         </div>
       </div>
+    </div>
+
+    <div id="drill-panel">
+      <button id="drill-close" onclick="closeDrill()">← Back to chat</button>
+      <div id="drill-body" class="drill-card"></div>
     </div>
 
     <div id="chat-area">
@@ -1108,6 +1218,7 @@
         }
       } catch (e) { /* ignore */ }
 
+      loadDrillBadge();
       await loadSessions();
       const items = document.querySelectorAll('.session-item');
       if (items.length > 0) {
@@ -1251,6 +1362,113 @@
     }
 
     window.playMidiNote = playMidiNote;
+
+    // ── Daily Scale Patch drill ──
+    const DRILL_PC = {
+      C:0,'B#':0,'C#':1,Db:1,D:2,'D#':3,Eb:3,E:4,Fb:4,F:5,'E#':5,
+      'F#':6,Gb:6,G:7,'G#':8,Ab:8,A:9,'A#':10,Bb:10,B:11,Cb:11,
+    };
+    function drillNameToMidi(name) {
+      const pc = DRILL_PC[name];
+      return pc === undefined ? null : 60 + pc;  // octave 4
+    }
+
+    async function loadDrillBadge() {
+      try {
+        const s = await (await fetch('/drill/status')).json();
+        const badge = document.getElementById('drill-badge');
+        if (s.due_today > 0) {
+          badge.textContent = `${s.due_today} due`;
+          badge.classList.remove('done');
+        } else {
+          badge.textContent = `🔥 ${s.streak_days}`;
+          badge.classList.add('done');
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    function openDrill() {
+      document.getElementById('chat-area').style.display = 'none';
+      document.getElementById('drill-panel').classList.add('open');
+      document.getElementById('drill-entry').classList.add('active');
+      drillNext();
+    }
+
+    function closeDrill() {
+      document.getElementById('drill-panel').classList.remove('open');
+      document.getElementById('drill-entry').classList.remove('active');
+      document.getElementById('chat-area').style.display = 'flex';
+      loadDrillBadge();
+    }
+
+    async function drillNext() {
+      const body = document.getElementById('drill-body');
+      const r = await (await fetch('/drill/next')).json();
+      if (!r.due) {
+        body.innerHTML = `<div class="drill-done">
+            <div class="big">✅ Patch done</div>
+            <div class="drill-sub">🔥 ${r.streak_days} day streak. Come back tomorrow.</div>
+            <button class="drill-btn secondary" onclick="closeDrill()">Back to chat</button>
+          </div>`;
+        return;
+      }
+      body.dataset.key = r.key;
+      body.innerHTML = `
+        <div class="drill-prompt">${r.prompt}</div>
+        <div class="drill-sub">${r.due_today} due today · ▶ hear after answering</div>
+        <input id="drill-answer" placeholder="e.g. D E F# G A B C#" autocomplete="off" />
+        <div><button class="drill-btn" onclick="submitDrill()">Submit</button></div>
+        <div class="drill-result" id="drill-result"></div>`;
+      const input = document.getElementById('drill-answer');
+      input.focus();
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitDrill(); });
+    }
+
+    async function submitDrill() {
+      const body = document.getElementById('drill-body');
+      const key = body.dataset.key;
+      const input = document.getElementById('drill-answer');
+      if (!input) return;
+      const answer = input.value.trim().split(/[\s,]+/).filter(Boolean);
+      if (!answer.length) return;
+      const r = await (await fetch('/drill/grade', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key, answer }),
+      })).json();
+
+      const notesHtml = r.per_note.map(p => {
+        const label = p.expected || p.got || '—';
+        return `<span class="drill-note ${p.ok ? 'ok' : 'bad'}">${label}</span>`;
+      }).join('');
+      const verdict = r.correct
+        ? '<div class="drill-verdict correct">✓ Correct</div>'
+        : '<div class="drill-verdict incorrect">✗ Not quite</div>';
+      document.getElementById('drill-result').innerHTML = `
+        ${verdict}
+        <div class="drill-notes">${notesHtml}</div>
+        <div class="drill-sub">${key} major: ${r.expected.join(' ')}</div>
+        <div>
+          <button class="drill-btn secondary" onclick="drillHear()">▶ Hear it</button>
+          <button class="drill-btn" onclick="drillNext()">Next</button>
+        </div>`;
+      document.getElementById('drill-body').dataset.expected = r.expected.join(',');
+      loadDrillBadge();
+      if (r.correct) drillHear();
+    }
+
+    function drillHear() {
+      const expected = (document.getElementById('drill-body').dataset.expected || '').split(',').filter(Boolean);
+      expected.forEach((name, i) => {
+        const midi = drillNameToMidi(name);
+        if (midi !== null) setTimeout(() => playMidiNote(midi), i * 350);
+      });
+    }
+
+    window.openDrill = openDrill;
+    window.closeDrill = closeDrill;
+    window.drillNext = drillNext;
+    window.submitDrill = submitDrill;
+    window.drillHear = drillHear;
 
     let _playingPollTimer = null;
 

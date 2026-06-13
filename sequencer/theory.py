@@ -14,7 +14,7 @@ import re
 from functools import lru_cache
 
 # music21 is a heavy import; keep it isolated here.
-from music21 import harmony, pitch as m21pitch, interval as m21interval
+from music21 import harmony, pitch as m21pitch, interval as m21interval, scale as m21scale
 
 # ── Canonical interval table (same as server.py) ─────────────────────────────
 # This is the source of truth for which qualities exist and their intervals.
@@ -266,6 +266,38 @@ def build_chord(root: str, quality: str, octave: int = 4) -> list[int]:
         raise ValueError(f"Unknown chord quality: {quality!r}. Supported: {sorted(CHORD_INTERVALS)}")
     midi_root = 12 * (octave + 1) + pc
     return [midi_root + i for i in intervals]
+
+
+_NOTE_NAME_RE = re.compile(r"^([A-Ga-g])([#b♯♭]{0,2})$")
+
+
+def normalize_note_name(s: str) -> str:
+    """Normalize a bare note name for grading: letter upper-cased, accidental ascii.
+
+    'f#' / 'F♯' -> 'F#';  'bb' -> 'Bb';  'cB' -> 'Cb'.  Does NOT remap enharmonics
+    ('Db' stays 'Db', never 'C#'). Raises ValueError on unparseable input.
+    """
+    raw = str(s or "").strip().replace("♯", "#").replace("♭", "b")
+    m = _NOTE_NAME_RE.match(raw)
+    if not m:
+        raise ValueError(f"Unknown note name: {s!r}. Use names like C, F#, Bb.")
+    letter, accidental = m.groups()
+    return letter.upper() + accidental
+
+
+@lru_cache(maxsize=64)
+def major_scale_notes(key: str) -> list[str]:
+    """Correctly-spelled note names of `key` major, tonic first, no octave.
+
+    e.g. "D" -> ["D","E","F#","G","A","B","C#"];
+         "Gb" -> ["Gb","Ab","Bb","Cb","Db","Eb","F"].
+    music21 supplies correct enharmonics (F# major -> E#, Cb major -> all flats).
+    """
+    tonic = normalize_note_name(key)
+    sc = m21scale.MajorScale(tonic)
+    # getPitches over one octave returns 8 pitches (tonic repeated at top); take 7.
+    pitches = sc.getPitches(f"{tonic}4", f"{tonic}5")[:7]
+    return [p.name.replace("-", "b") for p in pitches]
 
 
 def parse_pitch(value: str) -> tuple[str, int, int]:

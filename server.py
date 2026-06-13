@@ -19,9 +19,11 @@ from sequencer.abc import parse_abc, to_abc, ABCParseError, per_bar_report
 from sequencer.theory import (
     normalize_chord_quality, chord_note_names, build_chord, parse_pitch,
     NOTE_NAMES, CHORD_INTERVALS, midi_note_name as _theory_midi_note_name,
+    major_scale_notes, normalize_note_name,
 )
 import sequencer.model as seq_model
 import sequencer.engine as engine
+import sequencer.drill as drill
 from tools import TOOLS, SYSTEM_PROMPT, dispatch_tools
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,7 +37,7 @@ midi_note_name = _theory_midi_note_name
 
 
 SOUNDFONT = os.environ.get("SOUNDFONT", str(Path.home() / "Music" / "GeneralUser-GS.sf2"))
-DB_PATH = Path(__file__).parent / "midimi.db"
+DB_PATH = Path(os.environ.get("MIDIMI_DB", str(Path(__file__).parent / "midimi.db")))
 STATIC_DIR = Path(__file__).parent / "static"
 GENERATED_DIR = Path(__file__).parent / "generated" / "orchestrations"
 DEFAULT_INSTRUMENT = 0
@@ -261,6 +263,23 @@ def init_db():
         conn.execute("ALTER TABLE sessions ADD COLUMN starred INTEGER DEFAULT 0")
     except Exception:
         pass
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scale_drill (
+            key         TEXT PRIMARY KEY,
+            box         INTEGER DEFAULT 1,
+            due_at      INTEGER,
+            streak      INTEGER DEFAULT 0,
+            last_result TEXT,
+            last_seen   INTEGER
+        )
+    """)
+    # Seed the starter keys (idempotent), due now so they appear on first open.
+    now = int(time.time())
+    for key in drill.STARTER_KEYS:
+        conn.execute(
+            "INSERT OR IGNORE INTO scale_drill (key, box, due_at, streak) VALUES (?,1,?,0)",
+            (key, now),
+        )
     conn.commit()
     conn.close()
 
@@ -703,6 +722,154 @@ def play_single_midi(note: int):
         raise HTTPException(400, "MIDI note must be 0–127")
     play_in_background([note], 800)
     return {"ok": True}
+
+
+# ── Scale-patch drill ─────────────────────────────────────────────────────────
+
+def _drill_rows() -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT key, box, due_at, streak, last_result, last_seen FROM scale_drill"
+    ).fetchall()
+    conn.close()
+    cols = ("key", "box", "due_at", "streak", "last_result", "last_seen")
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def _drill_today() -> str:
+    """Server-local calendar day as YYYY-MM-DD."""
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def _drill_yesterday() -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(time.time() - drill.DAY_SECONDS))
+
+
+def _drill_due_count(rows: list[dict], now: int) -> int:
+    return sum(1 for r in rows if r["due_at"] is not None and r["due_at"] <= now)
+
+
+def _drill_streak_days() -> int:
+    return int(db_get_setting("drill_streak_days") or 0)
+
+
+class DrillGradeRequest(BaseModel):
+    key: str
+    answer: list[str]
+
+
+@app.get("/drill/next")
+def drill_next():
+    now = int(time.time())
+    rows = _drill_rows()
+    nxt = drill.pick_next(rows, now)
+    streak = _drill_streak_days()
+    if nxt is None:
+        return {"due": False, "streak_days": streak, "due_today": 0}
+    return {
+        "due": True,
+        "key": nxt["key"],
+        "prompt": f"Spell {nxt['key']} major",
+        "due_today": _drill_due_count(rows, now),
+        "streak_days": streak,
+    }
+
+
+@app.post("/drill/grade")
+def drill_grade(req: DrillGradeRequest):
+    now = int(time.time())
+    rows = _drill_rows()
+    row = next((r for r in rows if r["key"] == req.key), None)
+    if row is None:
+        raise HTTPException(404, f"Drill key not active: {req.key!r}")
+
+    try:
+        expected = major_scale_notes(req.key)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    # Normalize each answer note (tolerant of unicode/case, never enharmonic).
+    normalized: list[str | None] = []
+    for a in req.answer:
+        try:
+            normalized.append(normalize_note_name(a))
+        except ValueError:
+            normalized.append(None)
+
+    per_note = []
+    for i in range(max(len(expected), len(normalized))):
+        exp = expected[i] if i < len(expected) else None
+        got = normalized[i] if i < len(normalized) else None
+        per_note.append({"got": got, "expected": exp, "ok": got is not None and got == exp})
+    correct = len(normalized) == len(expected) and all(p["ok"] for p in per_note)
+
+    new_box, new_due = drill.schedule_after(row["box"], correct, now)
+    new_streak = row["streak"] + 1 if correct else 0
+    last_result = "correct" if correct else "incorrect"
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE scale_drill SET box=?, due_at=?, streak=?, last_result=?, last_seen=? WHERE key=?",
+        (new_box, new_due, new_streak, last_result, now, req.key),
+    )
+    conn.commit()
+    conn.close()
+
+    # Re-read for post-grade state (unlock + streak rely on the updated row).
+    rows = _drill_rows()
+    streak_days = _drill_streak_days()
+    if correct:
+        unlock = drill.maybe_unlock(rows, now)
+        if unlock:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute(
+                "INSERT OR IGNORE INTO scale_drill (key, box, due_at, streak) VALUES (?,1,?,0)",
+                (unlock, now),
+            )
+            conn.commit()
+            conn.close()
+            rows = _drill_rows()
+        # First completion that empties the queue today advances the daily streak.
+        if drill.pick_next(rows, now) is None:
+            today = _drill_today()
+            if db_get_setting("drill_last_completed_date") != today:
+                last = db_get_setting("drill_last_completed_date")
+                streak_days = streak_days + 1 if last == _drill_yesterday() else 1
+                db_set_setting("drill_streak_days", str(streak_days))
+                db_set_setting("drill_last_completed_date", today)
+
+    return {
+        "correct": correct,
+        "expected": expected,
+        "normalized_answer": normalized,
+        "per_note": per_note,
+        "box": new_box,
+        "due_today_remaining": _drill_due_count(rows, now),
+        "streak_days": streak_days,
+    }
+
+
+@app.get("/drill/status")
+def drill_status():
+    now = int(time.time())
+    rows = _drill_rows()
+    keys = [
+        {
+            "key": r["key"],
+            "box": r["box"],
+            "active": r["due_at"] is not None,
+            "last_result": r["last_result"],
+        }
+        for r in sorted(rows, key=lambda r: drill.ROTATION.index(r["key"])
+                        if r["key"] in drill.ROTATION else 99)
+    ]
+    due_today = _drill_due_count(rows, now)
+    return {
+        "keys": keys,
+        "due_today": due_today,
+        "streak_days": _drill_streak_days(),
+        "done_today": due_today == 0,
+    }
 
 
 # ── Recording endpoints ───────────────────────────────────────────────────────
