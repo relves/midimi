@@ -836,7 +836,7 @@ def dispatch_tools(
     note_registry: dict,
     sequence_registry: dict,
     resolve_sequence,          # callable(seq_id) -> dict | None
-    sequence_pill_fn,          # callable(seq_id, title, pill_id, duration_ms, midi_url, events) -> str
+    sequence_pill_fn,          # callable(seq_id, title, pill_id, duration_ms, midi_url, sequence_dict) -> str
     audio_pill_fn,             # callable(note_id, label, pill_id, notes, root, quality) -> str
     generated_dir: Path,
     play_notes_bg,             # callable(notes, duration_ms, note_id)
@@ -892,7 +892,7 @@ def dispatch_tools(
             engine.play_sequence_bg(seq_id, sequence)
             pill_id = f"p{str(uuid.uuid4())[:6]}"
             midi_url = f"/sequence/{seq_id}/download"
-            yield ("sse", sequence_pill_fn(seq_id, sequence["title"], pill_id, sequence["duration_ms"], midi_url, sequence["events"]))
+            yield ("sse", sequence_pill_fn(seq_id, sequence["title"], pill_id, sequence["duration_ms"], midi_url, sequence))
             yield ("record", {
                 "type": "sequence", "sequence_id": seq_id,
                 "title": sequence["title"], "duration_ms": sequence["duration_ms"],
@@ -1206,7 +1206,7 @@ def dispatch_tools(
             title = row["title"] if row else seq_id
             pill_id = f"p{str(uuid.uuid4())[:6]}"
             midi_url = f"/sequence/{seq_id}/download"
-            yield ("sse", sequence_pill_fn(seq_id, title, pill_id, seq_dict["duration_ms"], midi_url, seq_dict["events"]))
+            yield ("sse", sequence_pill_fn(seq_id, title, pill_id, seq_dict["duration_ms"], midi_url, seq_dict))
             bars_note = f" (bars {bars_str})" if bars_str else ""
             yield _ok(f"Playing '{title}'{bars_note}.")
 
@@ -1355,7 +1355,7 @@ def dispatch_tools(
             engine.play_sequence_bg(new_id, final_seq)
             pill_id = f"p{str(uuid.uuid4())[:6]}"
             midi_url = f"/sequence/{new_id}/download"
-            yield ("sse", sequence_pill_fn(new_id, title, pill_id, final_seq["duration_ms"], midi_url, final_seq["events"]))
+            yield ("sse", sequence_pill_fn(new_id, title, pill_id, final_seq["duration_ms"], midi_url, final_seq))
             yield ("record", {
                 "type": "sequence", "sequence_id": new_id,
                 "title": title, "duration_ms": final_seq["duration_ms"],

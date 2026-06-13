@@ -424,12 +424,16 @@ def audio_pill(
     )
 
 
-def sequence_pill(sequence_id: str, title: str, pill_id: str, duration_ms: int, midi_url: str, events: list[dict]) -> str:
+def sequence_pill(sequence_id: str, title: str, pill_id: str, duration_ms: int, midi_url: str, sequence: dict) -> str:
     import json as _json
     safe_title = html.escape(title or "Orchestration")
     seconds = max(1, round(duration_ms / 1000))
     staff_panel_id = f"{pill_id}-staff"
-    events_json = html.escape(_json.dumps(events), quote=True)
+    try:
+        abc_text = to_abc(sequence)
+    except Exception:
+        abc_text = ""
+    abc_json = html.escape(_json.dumps(abc_text), quote=True)
     return (
         f'<div class="pill-wrap">'
         f'  <div id="{pill_id}" class="audio-pill sequence-pill">'
@@ -437,7 +441,7 @@ def sequence_pill(sequence_id: str, title: str, pill_id: str, duration_ms: int, 
         f'    <span class="pill-label">♫ {safe_title}</span>'
         f'    <span class="sequence-meta">{seconds}s</span>'
         f'    <a class="download-btn" href="{html.escape(midi_url)}" title="Download MIDI">MIDI</a>'
-        f'    <button class="staff-btn" onclick="toggleSequenceStaff(\'{staff_panel_id}\', this, {events_json})" title="Show on staff">\U0001D11E</button>'
+        f'    <button class="staff-btn" onclick="toggleSequenceStaff(\'{staff_panel_id}\', this, {abc_json})" title="Show on staff">\U0001D11E</button>'
         f'  </div>'
         f'  <div id="{staff_panel_id}" class="staff-panel sequence-staff-panel"></div>'
         f'</div>'
@@ -644,12 +648,16 @@ def session_history(session_id: str):
                     midi_path = Path(p.get("midi_path", GENERATED_DIR / f"{sequence_id}.mid"))
                     if "sequence" in p:
                         _sequence_registry[sequence_id] = {"sequence": p["sequence"], "midi_path": midi_path}
+                    try:
+                        abc_text = to_abc(p["sequence"]) if "sequence" in p else ""
+                    except Exception:
+                        abc_text = ""
                     items.append({
                         "type": "sequence",
                         "sequence_id": sequence_id,
                         "title": p.get("title", "Orchestration"),
                         "duration_ms": p.get("duration_ms", 1000),
-                        "events": p.get("sequence", {}).get("events", []),
+                        "abc": abc_text,
                         "midi_url": f"/sequence/{sequence_id}/download",
                     })
             if items:
@@ -764,7 +772,7 @@ def record_stop(req: RecordStopRequest):
     midi_path = write_sequence_midi(seq_dict, seq_id)
     midi_url = f"/sequence/{seq_id}/download"
     duration_ms = seq_dict.get("duration_ms", 1000)
-    pill_html = sequence_pill(seq_id, req.title, f"pill-{seq_id}", duration_ms, midi_url, seq_dict["events"])
+    pill_html = sequence_pill(seq_id, req.title, f"pill-{seq_id}", duration_ms, midi_url, seq_dict)
 
     # Register in-memory so play works immediately (before any history reload)
     _sequence_registry[seq_id] = {"sequence": seq_dict, "midi_path": midi_path}
