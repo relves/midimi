@@ -290,6 +290,36 @@
     }
     #drill-close:hover { color: var(--text); }
 
+    /* Circle-of-fifths mastery grid */
+    #drill-grid-wrap { width: 100%; max-width: 520px; margin-bottom: 18px; text-align: center; }
+    #drill-grid-wrap .grid-title { color: var(--text-dim); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
+    #drill-grid { display: block; margin: 0 auto; }
+    #drill-grid .cof-node { cursor: default; transition: opacity 0.12s; }
+    #drill-grid .cof-label { font: 600 11px system-ui, sans-serif; fill: var(--text); pointer-events: none; }
+    #drill-grid .cof-ear { font: 700 8px system-ui, sans-serif; fill: var(--accent); pointer-events: none; }
+
+    /* Play-it mode */
+    .drill-mode-toggle { display: flex; gap: 6px; justify-content: center; margin-bottom: 16px; }
+    .drill-mode-toggle button {
+      padding: 6px 14px; font-size: 0.78rem; font-weight: 600; cursor: pointer;
+      background: var(--surface); border: 1px solid var(--border); color: var(--text-dim);
+      border-radius: 16px;
+    }
+    .drill-mode-toggle button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .drill-mode-toggle button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .drill-hint { color: var(--text-dim); font-size: 0.74rem; margin-top: 6px; }
+    .drill-recording { color: #f0a0a0; font-weight: 700; }
+
+    /* Ear-mode choice buttons */
+    .drill-choices { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin: 18px 0; }
+    .drill-choice {
+      min-width: 64px; padding: 14px 18px; font-size: 1.05rem; font-weight: 700; cursor: pointer;
+      background: var(--surface); border: 1px solid var(--accent-dim); border-radius: 10px; color: var(--text);
+    }
+    .drill-choice:hover { border-color: var(--accent); background: var(--surface2); }
+    .drill-choice.right { background: rgba(80,200,120,0.18); border-color: #50c878; color: #7fe0a0; }
+    .drill-choice.wrong { background: rgba(224,112,112,0.18); border-color: #e07070; color: #f0a0a0; }
+
     #chat-area {
       flex: 1;
       display: flex;
@@ -887,6 +917,10 @@
 
     <div id="drill-panel">
       <button id="drill-close" onclick="closeDrill()">← Back to chat</button>
+      <div id="drill-grid-wrap">
+        <div class="grid-title">Circle of Fifths · mastery</div>
+        <div id="drill-grid"></div>
+      </div>
       <div id="drill-body" class="drill-card"></div>
     </div>
 
@@ -1387,10 +1421,21 @@
       } catch (e) { /* ignore */ }
     }
 
-    function openDrill() {
+    // Drill UI state: play-it availability + current answer mode ('type' | 'play').
+    let _drillHasInput = false;
+    let _drillMode = 'type';
+    let _drillRecording = false;
+
+    async function openDrill() {
       document.getElementById('chat-area').style.display = 'none';
       document.getElementById('drill-panel').classList.add('open');
       document.getElementById('drill-entry').classList.add('active');
+      try {
+        const s = await (await fetch('/settings')).json();
+        _drillHasInput = !!s.current_input_port;
+      } catch (e) { _drillHasInput = false; }
+      if (!_drillHasInput) _drillMode = 'type';
+      await loadDrillGrid();
       drillNext();
     }
 
@@ -1401,9 +1446,62 @@
       loadDrillBadge();
     }
 
+    // ── Circle-of-fifths mastery grid ──
+    const COF = ['C','G','D','A','E','B','F#','Db','Ab','Eb','Bb','F'];  // clockwise from top
+    const BOX_COLORS = { 1:'#3a3550', 2:'#4b4a7a', 3:'#5d6fb0', 4:'#6fa8c8', 5:'#7fe0a0' };
+
+    async function loadDrillGrid() {
+      let s;
+      try { s = await (await fetch('/drill/status')).json(); }
+      catch (e) { return; }
+      const spell = {}, ear = {};
+      (s.keys || []).forEach(k => { (k.direction === 'ear' ? ear : spell)[k.key] = k; });
+
+      const size = 280, cx = size / 2, cy = size / 2, R = 110, r = 22;
+      let nodes = '';
+      COF.forEach((key, i) => {
+        const ang = (i / 12) * 2 * Math.PI - Math.PI / 2;
+        const x = cx + R * Math.cos(ang), y = cy + R * Math.sin(ang);
+        const row = spell[key];
+        const dormant = !row;
+        const fill = dormant ? '#262433' : (BOX_COLORS[row.box] || BOX_COLORS[1]);
+        const ring = row && row.due ? `<circle cx="${x}" cy="${y}" r="${r + 4}" fill="none" stroke="var(--accent)" stroke-width="2"/>` : '';
+        const earMark = ear[key] ? `<text class="cof-ear" x="${x}" y="${y + 15}" text-anchor="middle">ear</text>` : '';
+        const title = dormant ? `${key}: locked`
+          : `${key}: box ${row.box}${row.last_result ? ' · ' + row.last_result : ''}${row.due ? ' · due now' : ''}`;
+        nodes += `<g class="cof-node" opacity="${dormant ? 0.45 : 1}">
+            <title>${title}</title>
+            ${ring}
+            <circle cx="${x}" cy="${y}" r="${r}" fill="${fill}" stroke="var(--border)" stroke-width="1"/>
+            <text class="cof-label" x="${x}" y="${y + 4}" text-anchor="middle">${key}</text>
+            ${earMark}
+          </g>`;
+      });
+      document.getElementById('drill-grid').innerHTML =
+        `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">${nodes}</svg>`;
+    }
+
+    function drillModeToggle() {
+      const disabled = _drillHasInput ? '' : 'disabled';
+      const hint = _drillHasInput ? '' :
+        '<div class="drill-hint">Connect a MIDI keyboard in Settings to play your answer.</div>';
+      return `<div class="drill-mode-toggle">
+          <button class="${_drillMode === 'type' ? 'active' : ''}" onclick="setDrillMode('type')">⌨ Type</button>
+          <button class="${_drillMode === 'play' ? 'active' : ''}" ${disabled} onclick="setDrillMode('play')">🎹 Play it</button>
+        </div>${hint}`;
+    }
+
+    function setDrillMode(mode) {
+      if (mode === 'play' && !_drillHasInput) return;
+      _drillMode = mode;
+      drillNext();
+    }
+
     async function drillNext() {
+      _drillRecording = false;
       const body = document.getElementById('drill-body');
       const r = await (await fetch('/drill/next')).json();
+      await loadDrillGrid();
       if (!r.due) {
         body.innerHTML = `<div class="drill-done">
             <div class="big">✅ Patch done</div>
@@ -1413,15 +1511,94 @@
         return;
       }
       body.dataset.key = r.key;
+      body.dataset.direction = r.direction;
+
+      if (r.direction === 'ear') {
+        const choices = (r.choices || []).map(k =>
+          `<button class="drill-choice" data-key="${k}" onclick="submitEar('${k}')">${k}</button>`).join('');
+        body.innerHTML = `
+          <div class="drill-prompt">🔊 Name the key</div>
+          <div class="drill-sub">${r.due_today} due today · listen, then choose</div>
+          <div><button class="drill-btn secondary" onclick="drillPlayPrompt()">▶ Play scale</button></div>
+          <div class="drill-choices">${choices}</div>
+          <div class="drill-result" id="drill-result"></div>`;
+        drillPlayPrompt();
+        return;
+      }
+
+      // Spelling direction — type or play-it.
       body.innerHTML = `
+        ${drillModeToggle()}
         <div class="drill-prompt">${r.prompt}</div>
         <div class="drill-sub">${r.due_today} due today · ▶ hear after answering</div>
-        <input id="drill-answer" placeholder="e.g. D E F# G A B C#" autocomplete="off" />
-        <div><button class="drill-btn" onclick="submitDrill()">Submit</button></div>
+        <div id="drill-input-area"></div>
         <div class="drill-result" id="drill-result"></div>`;
-      const input = document.getElementById('drill-answer');
-      input.focus();
-      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitDrill(); });
+      renderDrillInput();
+    }
+
+    function renderDrillInput() {
+      const area = document.getElementById('drill-input-area');
+      if (_drillMode === 'play') {
+        area.innerHTML = `
+          <div class="drill-hint">Play the scale slowly, one hand. Octaves are fine — we grade the notes.</div>
+          <div><button class="drill-btn" id="drill-rec-btn" onclick="toggleDrillRecord()">● Start playing</button></div>`;
+      } else {
+        area.innerHTML = `
+          <input id="drill-answer" placeholder="e.g. D E F# G A B C#" autocomplete="off" />
+          <div><button class="drill-btn" onclick="submitDrill()">Submit</button></div>`;
+        const input = document.getElementById('drill-answer');
+        input.focus();
+        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitDrill(); });
+      }
+    }
+
+    async function toggleDrillRecord() {
+      const btn = document.getElementById('drill-rec-btn');
+      const key = document.getElementById('drill-body').dataset.key;
+      if (!_drillRecording) {
+        const res = await fetch('/drill/record/start', { method: 'POST' });
+        if (!res.ok) {
+          document.getElementById('drill-result').innerHTML =
+            '<div class="drill-hint">No MIDI input — open Settings to select one.</div>';
+          return;
+        }
+        _drillRecording = true;
+        btn.textContent = '■ Stop & grade';
+        btn.classList.add('drill-recording');
+      } else {
+        _drillRecording = false;
+        btn.disabled = true;
+        const r = await (await fetch('/drill/grade_played', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key }),
+        })).json();
+        renderPlayedResult(key, r);
+      }
+    }
+
+    function renderPlayedResult(key, r) {
+      const notesHtml = r.played_names.map(n => {
+        const ok = !r.wrong_notes.includes(n);
+        return `<span class="drill-note ${ok ? 'ok' : 'bad'}">${n}</span>`;
+      }).join('') || '<span class="drill-note bad">— nothing played —</span>';
+      const verdict = r.correct
+        ? '<div class="drill-verdict correct">✓ Correct</div>'
+        : '<div class="drill-verdict incorrect">✗ Not quite</div>';
+      const missing = r.missing_notes.length
+        ? `<div class="drill-sub">Missing: ${r.missing_notes.join(' ')}</div>` : '';
+      document.getElementById('drill-result').innerHTML = `
+        ${verdict}
+        <div class="drill-notes">${notesHtml}</div>
+        ${missing}
+        <div class="drill-sub">${key} major: ${r.expected.join(' ')}</div>
+        <div>
+          <button class="drill-btn secondary" onclick="drillHear()">▶ Hear it</button>
+          <button class="drill-btn" onclick="drillNext()">Next</button>
+        </div>`;
+      document.getElementById('drill-body').dataset.expected = r.expected.join(',');
+      loadDrillBadge();
+      loadDrillGrid();
+      if (r.correct) drillHear();
     }
 
     async function submitDrill() {
@@ -1433,7 +1610,7 @@
       if (!answer.length) return;
       const r = await (await fetch('/drill/grade', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key, answer }),
+        body: JSON.stringify({ key, answer, direction: 'spell' }),
       })).json();
 
       const notesHtml = r.per_note.map(p => {
@@ -1451,9 +1628,49 @@
           <button class="drill-btn secondary" onclick="drillHear()">▶ Hear it</button>
           <button class="drill-btn" onclick="drillNext()">Next</button>
         </div>`;
-      document.getElementById('drill-body').dataset.expected = r.expected.join(',');
+      body.dataset.expected = r.expected.join(',');
       loadDrillBadge();
+      loadDrillGrid();
       if (r.correct) drillHear();
+    }
+
+    function drillPlayPrompt() {
+      const key = document.getElementById('drill-body').dataset.key;
+      fetch('/drill/play_prompt', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key }),
+      }).catch(() => {});
+    }
+
+    async function submitEar(chosen) {
+      const body = document.getElementById('drill-body');
+      const key = body.dataset.key;
+      if (body.dataset.answered) return;
+      body.dataset.answered = '1';
+      const r = await (await fetch('/drill/grade', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key, direction: 'ear', choice: chosen }),
+      })).json();
+      document.querySelectorAll('.drill-choice').forEach(btn => {
+        const k = btn.dataset.key;
+        if (k === key) btn.classList.add('right');
+        else if (k === chosen) btn.classList.add('wrong');
+        btn.disabled = true;
+      });
+      const verdict = r.correct
+        ? '<div class="drill-verdict correct">✓ Correct</div>'
+        : `<div class="drill-verdict incorrect">✗ It was ${key}</div>`;
+      body.dataset.expected = r.expected.join(',');
+      document.getElementById('drill-result').innerHTML = `
+        ${verdict}
+        <div class="drill-sub">${key} major: ${r.expected.join(' ')}</div>
+        <div>
+          <button class="drill-btn secondary" onclick="drillHear()">▶ Compare</button>
+          <button class="drill-btn" onclick="drillNext()">Next</button>
+        </div>`;
+      delete body.dataset.answered;
+      loadDrillBadge();
+      loadDrillGrid();
     }
 
     function drillHear() {
@@ -1469,6 +1686,10 @@
     window.drillNext = drillNext;
     window.submitDrill = submitDrill;
     window.drillHear = drillHear;
+    window.setDrillMode = setDrillMode;
+    window.toggleDrillRecord = toggleDrillRecord;
+    window.drillPlayPrompt = drillPlayPrompt;
+    window.submitEar = submitEar;
 
     let _playingPollTimer = null;
 

@@ -18,6 +18,11 @@ BOX_INTERVALS_DAYS = {1: 0, 2: 1, 3: 2, 4: 4, 5: 8}
 
 MAX_BOX = 5
 UNLOCK_BOX = 3  # all active keys must reach this box before the next key unlocks
+EAR_UNLOCK_BOX = 3  # a key's spell box must reach this before its ear row unlocks
+
+# Drill directions. "spell" = key->notes (Slice 1); "ear" = sound->key (Slice 2).
+SPELL = "spell"
+EAR = "ear"
 
 
 def schedule_after(box: int, correct: bool, now: int) -> tuple[int, int]:
@@ -45,19 +50,107 @@ def pick_next(rows: list[dict], now: int) -> dict | None:
     return min(due, key=lambda r: (r["due_at"], r["key"]))
 
 
-def maybe_unlock(rows: list[dict], now: int) -> str | None:
-    """Next ROTATION key to seed, or None.
+def _direction(row: dict) -> str:
+    """Direction of a row, defaulting to SPELL for Slice-1 rows without the column."""
+    return row.get("direction", SPELL)
 
-    Unlocks only when every currently-active key is at box >= UNLOCK_BOX, keeping
-    the plan's "start with the starter set, expand outward" pacing automatic.
-    Returns the first ROTATION key not yet present in `rows`.
+
+def _spell_rows(rows: list[dict]) -> list[dict]:
+    return [r for r in rows if _direction(r) == SPELL]
+
+
+def maybe_unlock(rows: list[dict], now: int) -> str | None:
+    """Next ROTATION key to seed (as a `spell` row), or None.
+
+    Unlocks only when every currently-active *spell* key is at box >= UNLOCK_BOX,
+    keeping the plan's "start with the starter set, expand outward" pacing
+    automatic. Returns the first ROTATION key without a spell row yet.
     """
-    if not rows:
+    spell = _spell_rows(rows)
+    if not spell:
         return None
-    if any(r.get("box", 1) < UNLOCK_BOX for r in rows):
+    if any(r.get("box", 1) < UNLOCK_BOX for r in spell):
         return None
-    present = {r["key"] for r in rows}
+    present = {r["key"] for r in spell}
     for key in ROTATION:
         if key not in present:
             return key
     return None
+
+
+def ear_unlocks(rows: list[dict]) -> list[str]:
+    """Keys whose `spell` row has reached EAR_UNLOCK_BOX but have no `ear` row yet.
+
+    "You should be able to spell it before you're asked to recognize it by ear."
+    Returned in ROTATION order for determinism.
+    """
+    ear_present = {r["key"] for r in rows if _direction(r) == EAR}
+    ready = {
+        r["key"]
+        for r in _spell_rows(rows)
+        if r.get("box", 1) >= EAR_UNLOCK_BOX and r["key"] not in ear_present
+    }
+    return [k for k in ROTATION if k in ready]
+
+
+def ear_choices(key: str, n_distractors: int = 2, rng=None) -> list[str]:
+    """Multiple-choice options for an `ear` prompt: the true `key` plus distinct
+    circle-of-fifths neighbours as distractors. Never repeats the answer.
+
+    Neighbours (closest fifths first) make plausible distractors. Pass an `rng`
+    with `.shuffle` for deterministic tests; defaults to module `random`.
+    """
+    import random as _random
+
+    rng = rng or _random
+    idx = ROTATION.index(key)
+    neighbours: list[str] = []
+    for off in (1, -1, 2, -2, 3, -3, 4, -4):
+        cand = ROTATION[(idx + off) % len(ROTATION)]
+        if cand != key and cand not in neighbours:
+            neighbours.append(cand)
+    choices = [key] + neighbours[:max(0, n_distractors)]
+    rng.shuffle(choices)
+    return choices
+
+
+def grade_played(events: list[dict], key: str) -> dict:
+    """Grade recorded MIDI note-on events against `key` major, pitch-class tolerant.
+
+    Extracts note-on pitch classes in played order, de-dupes octaves (so a
+    two-octave run still reads as the 7-note set), and compares to the expected
+    pitch-class set. `correct` iff the played PC set == expected set AND no played
+    note falls outside the scale. `played_names` re-spells played notes with the
+    key's correct spelling so a right answer reinforces the spelling.
+    """
+    from sequencer.theory import major_scale_notes, NOTE_NAMES
+
+    expected_names = major_scale_notes(key)
+    name_by_pc = {NOTE_NAMES[n]: n for n in expected_names}
+    expected_pcs = [NOTE_NAMES[n] for n in expected_names]
+    expected_set = set(expected_pcs)
+
+    _SHARP = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+    played_midi = [e["note"] for e in events if e.get("on")]
+    played_pcs: list[int] = []
+    seen: set[int] = set()
+    for m in played_midi:
+        pc = m % 12
+        if pc not in seen:
+            seen.add(pc)
+            played_pcs.append(pc)
+
+    played_set = set(played_pcs)
+    wrong_pcs = [pc for pc in played_pcs if pc not in expected_set]
+    missing_pcs = [pc for pc in expected_pcs if pc not in played_set]
+    correct = played_set == expected_set and not wrong_pcs
+
+    return {
+        "correct": correct,
+        "expected": expected_names,
+        "played_midi": played_midi,
+        "played_names": [name_by_pc.get(pc, _SHARP[pc]) for pc in played_pcs],
+        "wrong_notes": [_SHARP[pc] for pc in wrong_pcs],
+        "missing_notes": [name_by_pc[pc] for pc in missing_pcs],
+    }

@@ -263,21 +263,43 @@ def init_db():
         conn.execute("ALTER TABLE sessions ADD COLUMN starred INTEGER DEFAULT 0")
     except Exception:
         pass
+    # Migrate a Slice-1 scale_drill (PK `key`) to the Slice-2 (key, direction) PK.
+    existing = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='scale_drill'"
+    ).fetchone()
+    if existing:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(scale_drill)").fetchall()]
+        if "direction" not in cols:
+            conn.execute("ALTER TABLE scale_drill RENAME TO scale_drill_old")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS scale_drill (
-            key         TEXT PRIMARY KEY,
+            key         TEXT NOT NULL,
+            direction   TEXT NOT NULL DEFAULT 'spell',
             box         INTEGER DEFAULT 1,
             due_at      INTEGER,
             streak      INTEGER DEFAULT 0,
             last_result TEXT,
-            last_seen   INTEGER
+            last_seen   INTEGER,
+            PRIMARY KEY (key, direction)
         )
     """)
+    old = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='scale_drill_old'"
+    ).fetchone()
+    if old:
+        conn.execute("""
+            INSERT OR IGNORE INTO scale_drill
+                (key, direction, box, due_at, streak, last_result, last_seen)
+            SELECT key, 'spell', box, due_at, streak, last_result, last_seen
+            FROM scale_drill_old
+        """)
+        conn.execute("DROP TABLE scale_drill_old")
     # Seed the starter keys (idempotent), due now so they appear on first open.
     now = int(time.time())
     for key in drill.STARTER_KEYS:
         conn.execute(
-            "INSERT OR IGNORE INTO scale_drill (key, box, due_at, streak) VALUES (?,1,?,0)",
+            "INSERT OR IGNORE INTO scale_drill (key, direction, box, due_at, streak) "
+            "VALUES (?, 'spell', 1, ?, 0)",
             (key, now),
         )
     conn.commit()
@@ -729,10 +751,10 @@ def play_single_midi(note: int):
 def _drill_rows() -> list[dict]:
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
-        "SELECT key, box, due_at, streak, last_result, last_seen FROM scale_drill"
+        "SELECT key, direction, box, due_at, streak, last_result, last_seen FROM scale_drill"
     ).fetchall()
     conn.close()
-    cols = ("key", "box", "due_at", "streak", "last_result", "last_seen")
+    cols = ("key", "direction", "box", "due_at", "streak", "last_result", "last_seen")
     return [dict(zip(cols, r)) for r in rows]
 
 
@@ -755,7 +777,90 @@ def _drill_streak_days() -> int:
 
 class DrillGradeRequest(BaseModel):
     key: str
-    answer: list[str]
+    answer: list[str] = []
+    direction: str = "spell"
+    choice: str | None = None  # chosen key for `ear` direction
+
+
+class DrillKeyRequest(BaseModel):
+    key: str
+
+
+def _drill_apply_grade(key: str, direction: str, correct: bool, now: int) -> tuple[int, int, list[dict]]:
+    """Persist a graded result and run the post-grade unlock/streak bookkeeping.
+
+    Returns (new_box, streak_days, rows-after) so callers can build their response.
+    Raises HTTPException(404) if the (key, direction) row is not active.
+    """
+    rows = _drill_rows()
+    row = next((r for r in rows if r["key"] == key and r["direction"] == direction), None)
+    if row is None:
+        raise HTTPException(404, f"Drill not active: {key!r} ({direction})")
+
+    new_box, new_due = drill.schedule_after(row["box"], correct, now)
+    new_streak = row["streak"] + 1 if correct else 0
+    last_result = "correct" if correct else "incorrect"
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE scale_drill SET box=?, due_at=?, streak=?, last_result=?, last_seen=? "
+        "WHERE key=? AND direction=?",
+        (new_box, new_due, new_streak, last_result, now, key, direction),
+    )
+    conn.commit()
+    conn.close()
+
+    rows = _drill_rows()
+    streak_days = _drill_streak_days()
+    if correct:
+        # Unlock the next circle-of-fifths key (spell) once the set is internalized.
+        unlock = drill.maybe_unlock(rows, now)
+        if unlock:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute(
+                "INSERT OR IGNORE INTO scale_drill (key, direction, box, due_at, streak) "
+                "VALUES (?, 'spell', 1, ?, 0)",
+                (unlock, now),
+            )
+            conn.commit()
+            conn.close()
+            rows = _drill_rows()
+        # Unlock ear rows for keys whose spelling is solid (box >= EAR_UNLOCK_BOX).
+        ear_new = drill.ear_unlocks(rows)
+        if ear_new:
+            conn = sqlite3.connect(DB_PATH)
+            for k in ear_new:
+                conn.execute(
+                    "INSERT OR IGNORE INTO scale_drill (key, direction, box, due_at, streak) "
+                    "VALUES (?, 'ear', 1, ?, 0)",
+                    (k, now),
+                )
+            conn.commit()
+            conn.close()
+            rows = _drill_rows()
+        # First completion that empties the queue today advances the daily streak.
+        if drill.pick_next(rows, now) is None:
+            today = _drill_today()
+            if db_get_setting("drill_last_completed_date") != today:
+                last = db_get_setting("drill_last_completed_date")
+                streak_days = streak_days + 1 if last == _drill_yesterday() else 1
+                db_set_setting("drill_streak_days", str(streak_days))
+                db_set_setting("drill_last_completed_date", today)
+
+    return new_box, streak_days, rows
+
+
+def _scale_midi_ascending(key: str) -> list[int]:
+    """MIDI numbers for `key` major ascending from octave 4 (monotonic across the wrap)."""
+    midis = [60 + NOTE_NAMES[n] for n in major_scale_notes(key)]
+    asc: list[int] = []
+    prev = -1
+    for m in midis:
+        while m <= prev:
+            m += 12
+        asc.append(m)
+        prev = m
+    return asc
 
 
 @app.get("/drill/next")
@@ -766,27 +871,46 @@ def drill_next():
     streak = _drill_streak_days()
     if nxt is None:
         return {"due": False, "streak_days": streak, "due_today": 0}
-    return {
+    direction = nxt.get("direction", "spell")
+    out = {
         "due": True,
         "key": nxt["key"],
-        "prompt": f"Spell {nxt['key']} major",
+        "direction": direction,
         "due_today": _drill_due_count(rows, now),
         "streak_days": streak,
     }
+    if direction == "ear":
+        out["prompt"] = "Name the key you hear"
+        out["choices"] = drill.ear_choices(nxt["key"])
+    else:
+        out["prompt"] = f"Spell {nxt['key']} major"
+    return out
 
 
 @app.post("/drill/grade")
 def drill_grade(req: DrillGradeRequest):
     now = int(time.time())
-    rows = _drill_rows()
-    row = next((r for r in rows if r["key"] == req.key), None)
-    if row is None:
-        raise HTTPException(404, f"Drill key not active: {req.key!r}")
 
     try:
         expected = major_scale_notes(req.key)
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+    if req.direction == "ear":
+        # Ear answer is the chosen key; grading is exact key match.
+        chosen = (req.choice or "").strip()
+        correct = chosen == req.key
+        new_box, streak_days, rows = _drill_apply_grade(req.key, "ear", correct, now)
+        return {
+            "correct": correct,
+            "direction": "ear",
+            "key": req.key,
+            "chosen": chosen,
+            "expected": expected,
+            "box": new_box,
+            "due_today_remaining": _drill_due_count(rows, now),
+            "streak_days": streak_days,
+        }
 
     # Normalize each answer note (tolerant of unicode/case, never enharmonic).
     normalized: list[str | None] = []
@@ -803,43 +927,11 @@ def drill_grade(req: DrillGradeRequest):
         per_note.append({"got": got, "expected": exp, "ok": got is not None and got == exp})
     correct = len(normalized) == len(expected) and all(p["ok"] for p in per_note)
 
-    new_box, new_due = drill.schedule_after(row["box"], correct, now)
-    new_streak = row["streak"] + 1 if correct else 0
-    last_result = "correct" if correct else "incorrect"
-
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "UPDATE scale_drill SET box=?, due_at=?, streak=?, last_result=?, last_seen=? WHERE key=?",
-        (new_box, new_due, new_streak, last_result, now, req.key),
-    )
-    conn.commit()
-    conn.close()
-
-    # Re-read for post-grade state (unlock + streak rely on the updated row).
-    rows = _drill_rows()
-    streak_days = _drill_streak_days()
-    if correct:
-        unlock = drill.maybe_unlock(rows, now)
-        if unlock:
-            conn = sqlite3.connect(DB_PATH)
-            conn.execute(
-                "INSERT OR IGNORE INTO scale_drill (key, box, due_at, streak) VALUES (?,1,?,0)",
-                (unlock, now),
-            )
-            conn.commit()
-            conn.close()
-            rows = _drill_rows()
-        # First completion that empties the queue today advances the daily streak.
-        if drill.pick_next(rows, now) is None:
-            today = _drill_today()
-            if db_get_setting("drill_last_completed_date") != today:
-                last = db_get_setting("drill_last_completed_date")
-                streak_days = streak_days + 1 if last == _drill_yesterday() else 1
-                db_set_setting("drill_streak_days", str(streak_days))
-                db_set_setting("drill_last_completed_date", today)
+    new_box, streak_days, rows = _drill_apply_grade(req.key, "spell", correct, now)
 
     return {
         "correct": correct,
+        "direction": "spell",
         "expected": expected,
         "normalized_answer": normalized,
         "per_note": per_note,
@@ -849,6 +941,51 @@ def drill_grade(req: DrillGradeRequest):
     }
 
 
+@app.post("/drill/record/start")
+def drill_record_start():
+    if engine.current_input_port() is None:
+        raise HTTPException(400, "No MIDI input port selected. Open Settings to choose one.")
+    engine.arm_recording()
+    return {"ok": True, "recording": True}
+
+
+@app.post("/drill/grade_played")
+def drill_grade_played(req: DrillKeyRequest):
+    now = int(time.time())
+    try:
+        major_scale_notes(req.key)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    events = engine.stop_recording()
+    graded = drill.grade_played(events, req.key)
+    new_box, streak_days, rows = _drill_apply_grade(req.key, "spell", graded["correct"], now)
+
+    return {
+        **graded,
+        "direction": "spell",
+        "key": req.key,
+        "box": new_box,
+        "due_today_remaining": _drill_due_count(rows, now),
+        "streak_days": streak_days,
+    }
+
+
+@app.post("/drill/play_prompt")
+def drill_play_prompt(req: DrillKeyRequest):
+    try:
+        asc = _scale_midi_ascending(req.key)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    def _run():
+        for m in asc:
+            _play([m], 320)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True}
+
+
 @app.get("/drill/status")
 def drill_status():
     now = int(time.time())
@@ -856,12 +993,21 @@ def drill_status():
     keys = [
         {
             "key": r["key"],
+            "direction": r.get("direction", "spell"),
             "box": r["box"],
             "active": r["due_at"] is not None,
+            "due": r["due_at"] is not None and r["due_at"] <= now,
+            "due_at": r["due_at"],
+            "streak": r["streak"],
             "last_result": r["last_result"],
         }
-        for r in sorted(rows, key=lambda r: drill.ROTATION.index(r["key"])
-                        if r["key"] in drill.ROTATION else 99)
+        for r in sorted(
+            rows,
+            key=lambda r: (
+                drill.ROTATION.index(r["key"]) if r["key"] in drill.ROTATION else 99,
+                r.get("direction", "spell"),
+            ),
+        )
     ]
     due_today = _drill_due_count(rows, now)
     return {
