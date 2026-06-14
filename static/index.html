@@ -1675,9 +1675,16 @@
 
     function drillHear() {
       const expected = (document.getElementById('drill-body').dataset.expected || '').split(',').filter(Boolean);
-      expected.forEach((name, i) => {
-        const midi = drillNameToMidi(name);
-        if (midi !== null) setTimeout(() => playMidiNote(midi), i * 350);
+      // Ascend monotonically: bump the octave whenever the pitch class wraps,
+      // so e.g. Bb major sounds Bb-C-D-... ascending instead of jumping octaves.
+      let prev = -1, step = 0;
+      expected.forEach((name) => {
+        let midi = drillNameToMidi(name);
+        if (midi === null) return;
+        while (midi <= prev) midi += 12;
+        prev = midi;
+        const m = midi;
+        setTimeout(() => playMidiNote(m), step++ * 350);
       });
     }
 
