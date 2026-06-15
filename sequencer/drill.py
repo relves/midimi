@@ -5,6 +5,8 @@ handlers in server.py own persistence; everything here is plain data in/out so
 it can be unit-tested without a DB or audio.
 """
 
+import datetime
+
 # Circle-of-fifths order. The first 7 are the Slice-1 starter set; the rest stay
 # dormant (absent from the DB) until maybe_unlock seeds them.
 ROTATION = ["C", "G", "F", "D", "Bb", "A", "Eb", "B", "Db", "F#", "Gb", "Cb", "C#"]
@@ -25,16 +27,34 @@ SPELL = "spell"
 EAR = "ear"
 
 
+def _due_at_local_midnight(now: int, days: int) -> int:
+    """Epoch seconds for 00:00 local time, `days` calendar days after `now`.
+
+    `days == 0` means "due immediately" (returns `now` unchanged). For days >= 1
+    we snap to the start of the target local day so a card scheduled "tomorrow"
+    is waiting the moment the next calendar day begins, regardless of what clock
+    time the previous session ended at. This avoids the rolling-24h lockout where
+    a 9pm session wouldn't come due again until 9pm the next day.
+    """
+    if days <= 0:
+        return now
+    local = datetime.datetime.fromtimestamp(now).astimezone()
+    target = (local + datetime.timedelta(days=days)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    return int(target.timestamp())
+
+
 def schedule_after(box: int, correct: bool, now: int) -> tuple[int, int]:
     """Return (new_box, new_due_at) after grading a key.
 
-    Correct -> promote one box (capped at MAX_BOX), push due_at out by the new
-    box's interval. Wrong -> reset to box 1, due immediately (re-drill this
-    session via pick_next's most-overdue selection).
+    Correct -> promote one box (capped at MAX_BOX), push due_at out to the start
+    of the local day the new box's interval lands on. Wrong -> reset to box 1,
+    due immediately (re-drill this session via pick_next's most-overdue
+    selection).
     """
     if correct:
         new_box = min(box + 1, MAX_BOX)
-        return new_box, now + BOX_INTERVALS_DAYS[new_box] * DAY_SECONDS
+        return new_box, _due_at_local_midnight(now, BOX_INTERVALS_DAYS[new_box])
     return 1, now
 
 

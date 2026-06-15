@@ -60,16 +60,34 @@ def test_normalize_rejects_garbage():
 
 # ── schedule_after ───────────────────────────────────────────────────────────
 
-def test_schedule_after_correct_promotes_and_pushes_due():
+def test_schedule_after_correct_promotes_and_snaps_to_local_midnight():
     box, due = drill.schedule_after(1, True, 1000)
     assert box == 2
-    assert due == 1000 + drill.BOX_INTERVALS_DAYS[2] * drill.DAY_SECONDS
+    assert due == drill._due_at_local_midnight(1000, drill.BOX_INTERVALS_DAYS[2])
 
 
 def test_schedule_after_correct_caps_at_max_box():
     box, due = drill.schedule_after(5, True, 1000)
     assert box == 5
-    assert due == 1000 + drill.BOX_INTERVALS_DAYS[5] * drill.DAY_SECONDS
+    assert due == drill._due_at_local_midnight(1000, drill.BOX_INTERVALS_DAYS[5])
+
+
+def test_due_at_local_midnight_lands_on_calendar_day_start():
+    import datetime
+    # 9:26pm local on some day -> box-2 (1 day) card is due 00:00 the next day,
+    # not 9:26pm the next day (the old rolling-24h behavior).
+    now_local = datetime.datetime(2026, 6, 14, 21, 26, 40).astimezone()
+    now = int(now_local.timestamp())
+    due = drill._due_at_local_midnight(now, 1)
+    due_local = datetime.datetime.fromtimestamp(due).astimezone()
+    assert (due_local.hour, due_local.minute, due_local.second) == (0, 0, 0)
+    assert due_local.date() == datetime.date(2026, 6, 15)
+    # Strictly earlier than the old rolling-24h result.
+    assert due < now + drill.DAY_SECONDS
+
+
+def test_due_at_local_midnight_zero_days_is_now():
+    assert drill._due_at_local_midnight(1000, 0) == 1000
 
 
 def test_schedule_after_wrong_resets_to_box1_due_now():
