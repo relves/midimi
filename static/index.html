@@ -283,13 +283,6 @@
     .drill-verdict.incorrect { color: #f0a0a0; }
     .drill-done { text-align: center; }
     .drill-done .big { font-size: 1.4rem; font-weight: 700; margin-bottom: 8px; }
-    #drill-close {
-      align-self: flex-start;
-      background: none; border: none; color: var(--text-dim);
-      cursor: pointer; font-size: 0.85rem; margin-bottom: 12px;
-    }
-    #drill-close:hover { color: var(--text); }
-
     /* Circle-of-fifths mastery grid */
     #drill-grid-wrap { width: 100%; max-width: 520px; margin-bottom: 18px; text-align: center; }
     #drill-grid-wrap .grid-title { color: var(--text-dim); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
@@ -916,7 +909,6 @@
     </div>
 
     <div id="drill-panel">
-      <button id="drill-close" onclick="closeDrill()">← Back to chat</button>
       <div id="drill-grid-wrap">
         <div class="grid-title">Circle of Fifths · mastery</div>
         <div id="drill-grid"></div>
@@ -1168,7 +1160,8 @@
     }
 
     async function switchSession(sid) {
-      if (sid === sessionId) return;
+      if (sid === sessionId) { closeDrill(); return; }
+      closeDrill();
       sessionId = sid;
       markActiveSession();
 
@@ -1233,6 +1226,7 @@
     }
 
     async function startNewSession() {
+      closeDrill();
       const r = await fetch('/session/new');
       const data = await r.json();
       sessionId = data.id;
@@ -1425,8 +1419,9 @@
     let _drillHasInput = false;
     let _drillMode = 'type';
     let _drillRecording = false;
+    let _drillPractice = false;  // true = free practice (circle click); never grades the schedule
 
-    async function openDrill() {
+    async function _openDrillPanel() {
       document.getElementById('chat-area').style.display = 'none';
       document.getElementById('drill-panel').classList.add('open');
       document.getElementById('drill-entry').classList.add('active');
@@ -1436,11 +1431,42 @@
       } catch (e) { _drillHasInput = false; }
       if (!_drillHasInput) _drillMode = 'type';
       await loadDrillGrid();
+    }
+
+    async function openDrill() {
+      _drillPractice = false;
+      await _openDrillPanel();
       drillNext();
     }
 
+    // Jump straight into spelling any key from the circle of fifths. Orthogonal
+    // to the daily patch: pure practice, never touches the SRS schedule.
+    async function practiceKey(key) {
+      _drillPractice = true;
+      _drillRecording = false;
+      await _openDrillPanel();
+      renderSpellCard(key, `Spell ${key} major`,
+        'Practice · doesn’t affect your schedule · ▶ hear after answering');
+    }
+
+    // Shared spelling-card renderer for both the scheduled drill and free practice.
+    function renderSpellCard(key, prompt, sub) {
+      const body = document.getElementById('drill-body');
+      body.dataset.key = key;
+      body.dataset.direction = 'spell';
+      body.innerHTML = `
+        ${drillModeToggle()}
+        <div class="drill-prompt">${prompt}</div>
+        <div class="drill-sub">${sub}</div>
+        <div id="drill-input-area"></div>
+        <div class="drill-result" id="drill-result"></div>`;
+      renderDrillInput();
+    }
+
     function closeDrill() {
-      document.getElementById('drill-panel').classList.remove('open');
+      const panel = document.getElementById('drill-panel');
+      if (!panel.classList.contains('open')) return;
+      panel.classList.remove('open');
       document.getElementById('drill-entry').classList.remove('active');
       document.getElementById('chat-area').style.display = 'flex';
       loadDrillBadge();
@@ -1469,8 +1495,8 @@
         const earMark = ear[key] ? `<text class="cof-ear" x="${x}" y="${y + 15}" text-anchor="middle">ear</text>` : '';
         const title = dormant ? `${key}: locked`
           : `${key}: box ${row.box}${row.last_result ? ' · ' + row.last_result : ''}${row.due ? ' · due now' : ''}`;
-        nodes += `<g class="cof-node" opacity="${dormant ? 0.45 : 1}">
-            <title>${title}</title>
+        nodes += `<g class="cof-node" opacity="${dormant ? 0.45 : 1}" style="cursor:pointer" onclick="practiceKey('${key}')">
+            <title>${title} · click to practice</title>
             ${ring}
             <circle cx="${x}" cy="${y}" r="${r}" fill="${fill}" stroke="var(--border)" stroke-width="1"/>
             <text class="cof-label" x="${x}" y="${y + 4}" text-anchor="middle">${key}</text>
@@ -1498,6 +1524,7 @@
     }
 
     async function drillNext() {
+      _drillPractice = false;  // /drill/next is the scheduled queue, always graded
       _drillRecording = false;
       const body = document.getElementById('drill-body');
       const r = await (await fetch('/drill/next')).json();
@@ -1527,13 +1554,7 @@
       }
 
       // Spelling direction — type or play-it.
-      body.innerHTML = `
-        ${drillModeToggle()}
-        <div class="drill-prompt">${r.prompt}</div>
-        <div class="drill-sub">${r.due_today} due today · ▶ hear after answering</div>
-        <div id="drill-input-area"></div>
-        <div class="drill-result" id="drill-result"></div>`;
-      renderDrillInput();
+      renderSpellCard(r.key, r.prompt, `${r.due_today} due today · ▶ hear after answering`);
     }
 
     function renderDrillInput() {
@@ -1570,7 +1591,7 @@
         btn.disabled = true;
         const r = await (await fetch('/drill/grade_played', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ key }),
+          body: JSON.stringify({ key, graded: !_drillPractice }),
         })).json();
         renderPlayedResult(key, r);
       }
@@ -1610,7 +1631,7 @@
       if (!answer.length) return;
       const r = await (await fetch('/drill/grade', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key, answer, direction: 'spell' }),
+        body: JSON.stringify({ key, answer, direction: 'spell', graded: !_drillPractice }),
       })).json();
 
       const notesHtml = r.per_note.map(p => {
@@ -1691,6 +1712,7 @@
     }
 
     window.openDrill = openDrill;
+    window.practiceKey = practiceKey;
     window.closeDrill = closeDrill;
     window.drillNext = drillNext;
     window.submitDrill = submitDrill;

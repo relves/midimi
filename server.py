@@ -780,10 +780,25 @@ class DrillGradeRequest(BaseModel):
     answer: list[str] = []
     direction: str = "spell"
     choice: str | None = None  # chosen key for `ear` direction
+    graded: bool = True  # False = free practice; never touches the SRS schedule
 
 
 class DrillKeyRequest(BaseModel):
     key: str
+    graded: bool = True  # False = free practice; never touches the SRS schedule
+
+
+def _drill_practice_result(key: str, direction: str) -> tuple[int, int, list[dict]]:
+    """Read-only counterpart to `_drill_apply_grade` for free practice.
+
+    Grades happen the same way, but nothing is persisted: no box promotion, no
+    due_at change, no streak. Returns (box, streak_days, rows) shaped like
+    `_drill_apply_grade` so handlers can build an identical response. `box` is
+    the key's current box (0 if it has no active row, e.g. a dormant key).
+    """
+    rows = _drill_rows()
+    row = next((r for r in rows if r["key"] == key and r["direction"] == direction), None)
+    return (row["box"] if row else 0), _drill_streak_days(), rows
 
 
 def _drill_apply_grade(key: str, direction: str, correct: bool, now: int) -> tuple[int, int, list[dict]]:
@@ -900,7 +915,9 @@ def drill_grade(req: DrillGradeRequest):
         # Ear answer is the chosen key; grading is exact key match.
         chosen = (req.choice or "").strip()
         correct = chosen == req.key
-        new_box, streak_days, rows = _drill_apply_grade(req.key, "ear", correct, now)
+        new_box, streak_days, rows = (
+            _drill_apply_grade(req.key, "ear", correct, now) if req.graded
+            else _drill_practice_result(req.key, "ear"))
         return {
             "correct": correct,
             "direction": "ear",
@@ -933,7 +950,9 @@ def drill_grade(req: DrillGradeRequest):
         per_note.append({"got": got, "expected": exp, "ok": got is not None and got == exp})
     correct = len(normalized) == len(target) and all(p["ok"] for p in per_note)
 
-    new_box, streak_days, rows = _drill_apply_grade(req.key, "spell", correct, now)
+    new_box, streak_days, rows = (
+        _drill_apply_grade(req.key, "spell", correct, now) if req.graded
+        else _drill_practice_result(req.key, "spell"))
 
     return {
         "correct": correct,
@@ -965,7 +984,9 @@ def drill_grade_played(req: DrillKeyRequest):
 
     events = engine.stop_recording()
     graded = drill.grade_played(events, req.key)
-    new_box, streak_days, rows = _drill_apply_grade(req.key, "spell", graded["correct"], now)
+    new_box, streak_days, rows = (
+        _drill_apply_grade(req.key, "spell", graded["correct"], now) if req.graded
+        else _drill_practice_result(req.key, "spell"))
 
     return {
         **graded,
