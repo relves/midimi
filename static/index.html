@@ -1675,6 +1675,8 @@
 
     function drillHear() {
       const expected = (document.getElementById('drill-body').dataset.expected || '').split(',').filter(Boolean);
+      // Resolve to the octave: repeat the tonic on top so the scale completes.
+      if (expected.length) expected.push(expected[0]);
       // Ascend monotonically: bump the octave whenever the pitch class wraps,
       // so e.g. Bb major sounds Bb-C-D-... ascending instead of jumping octaves.
       let prev = -1, step = 0;

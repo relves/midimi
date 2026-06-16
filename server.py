@@ -920,12 +920,18 @@ def drill_grade(req: DrillGradeRequest):
         except ValueError:
             normalized.append(None)
 
+    # Accept an optional octave note: the tonic repeated at the top
+    # (e.g. C D E F G A B C in C major).
+    target = expected
+    if len(normalized) == len(expected) + 1 and normalized[-1] == expected[0]:
+        target = expected + [expected[0]]
+
     per_note = []
-    for i in range(max(len(expected), len(normalized))):
-        exp = expected[i] if i < len(expected) else None
+    for i in range(max(len(target), len(normalized))):
+        exp = target[i] if i < len(target) else None
         got = normalized[i] if i < len(normalized) else None
         per_note.append({"got": got, "expected": exp, "ok": got is not None and got == exp})
-    correct = len(normalized) == len(expected) and all(p["ok"] for p in per_note)
+    correct = len(normalized) == len(target) and all(p["ok"] for p in per_note)
 
     new_box, streak_days, rows = _drill_apply_grade(req.key, "spell", correct, now)
 
