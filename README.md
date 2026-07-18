@@ -71,6 +71,38 @@ If your soundfont is in a different location:
 SOUNDFONT=/path/to/your.sf2 .venv/bin/uvicorn server:app
 ```
 
+## Loop transport
+
+A looping backing track: it plays a chord chart in time — piano comp, root bass, and a
+click — until you stop it, and exposes where you are in the form.
+
+```bash
+curl -X POST localhost:8000/loop/start -H 'content-type: application/json' -d '{
+  "chords": [
+    {"symbol": "F7",  "bars": 4}, {"symbol": "Bb7", "bars": 2},
+    {"symbol": "F7",  "bars": 2}, {"symbol": "C7",  "bars": 1},
+    {"symbol": "Bb7", "bars": 1}, {"symbol": "F7",  "bars": 2}
+  ],
+  "tempo_bpm": 120, "feel": "shuffle"
+}'
+```
+
+| Endpoint | What it does |
+|---|---|
+| `POST /loop/start` | Start (or replace) the loop; returns the initial position and rendered chart |
+| `POST /loop/stop` | Stop the loop and release any sounding notes |
+| `GET /loop/position` | Current `bar`, `beat`, `chord`, `next_chord` — poll this to draw a bar cursor |
+| `GET /loop/chart` | The rendered chart with per-chord voicings |
+
+Options on `/loop/start`: `tempo_bpm`, `time_signature`, `feel` (`straight`/`shuffle`),
+`count_in_bars`, `comp_style` (`charleston`/`pad`), `voicing_style`, `repeats`, and
+`click` / `comp` / `bass` toggles. Set `rootless: true` to drop the root from the comp
+voicings so you can practise rootless shapes against the bass.
+
+Bar and beat are reported on the straight grid even under shuffle — the feel changes where
+notes land, not where you count. The comp, bass, and click use MIDI channels 1, 2, and 9,
+so ordinary chord playback (channel 0) still works over a running loop.
+
 ## Usage tips
 
 - Ask about any music theory concept — chord types, scales, intervals, progressions, modes

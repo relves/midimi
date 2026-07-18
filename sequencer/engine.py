@@ -23,6 +23,7 @@ _stop_event = threading.Event()
 _note_on_fn: Callable[[int, int, int], None] | None = None
 _note_off_fn: Callable[[int, int], None] | None = None
 _play_fn: Callable[[list[int], int], None] | None = None
+_program_fn: Callable[[int, int], None] | None = None
 _current_port: str | None = None
 _current_fs: fluidsynth.Synth | None = None
 
@@ -138,13 +139,25 @@ def set_note_fns(
     note_off: Callable[[int, int], None],
     play: Callable[[list[int], int], None],
     port: str | None,
+    program: Callable[[int, int], None] | None = None,
 ) -> None:
-    """Wire engine to externally created note_on/note_off/play functions (e.g. from server.py)."""
-    global _note_on_fn, _note_off_fn, _play_fn, _current_port
+    """Wire engine to externally created note_on/note_off/play functions (e.g. from server.py).
+
+    `program` is optional: players that can't change programs simply won't, and
+    `set_program` becomes a no-op.
+    """
+    global _note_on_fn, _note_off_fn, _play_fn, _current_port, _program_fn
     _note_on_fn = note_on
     _note_off_fn = note_off
     _play_fn = play
     _current_port = port
+    _program_fn = program
+
+
+def set_program(channel: int, program: int) -> None:
+    """Select a General MIDI program on a channel. No-op if the player can't change programs."""
+    if _program_fn is not None:
+        _program_fn(channel, program)
 
 
 def init_player() -> None:
@@ -173,7 +186,7 @@ def init_player() -> None:
 
 
 def _init_midi_port(port_name: str) -> None:
-    global _play_fn, _note_on_fn, _note_off_fn, _current_port
+    global _play_fn, _note_on_fn, _note_off_fn, _current_port, _program_fn
     port = mido.open_output(port_name)
     print(f"MIDI out: {port_name}")
 
@@ -193,14 +206,18 @@ def _init_midi_port(port_name: str) -> None:
             for n in notes:
                 note_off(n, DEFAULT_CHANNEL)
 
+    def program(channel: int, prog: int) -> None:
+        port.send(mido.Message("program_change", channel=channel, program=prog))
+
     _note_on_fn = note_on
     _note_off_fn = note_off
     _play_fn = play
+    _program_fn = program
     _current_port = port_name
 
 
 def _init_fluidsynth() -> None:
-    global _play_fn, _note_on_fn, _note_off_fn, _current_port, _current_fs
+    global _play_fn, _note_on_fn, _note_off_fn, _current_port, _current_fs, _program_fn
     if _current_fs is not None:
         try:
             _current_fs.delete()
@@ -240,9 +257,13 @@ def _init_fluidsynth() -> None:
             for n in notes:
                 note_off(n, DEFAULT_CHANNEL)
 
+    def program(channel: int, prog: int) -> None:
+        fs.program_select(channel, sfid, 0, prog)
+
     _note_on_fn = note_on
     _note_off_fn = note_off
     _play_fn = play
+    _program_fn = program
     _current_port = None
 
 

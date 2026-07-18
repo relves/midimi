@@ -546,6 +546,7 @@ def voice_progression(
     chords: list[dict],
     melody: list[str | None] | None = None,
     style: str = "close",
+    omit_root: bool = False,
 ) -> dict:
     """Voice a chord progression with minimal-motion voice leading.
 
@@ -558,6 +559,8 @@ def voice_progression(
         Optional per-chord melody note list (overrides melody_note in chords).
     style : str
         "close" | "drop2" | "shell" | "spread"
+    omit_root : bool
+        Drop the root from every voicing (rootless comping over a bass line).
 
     Returns
     -------
@@ -581,7 +584,8 @@ def voice_progression(
 
         # Try all inversions/registers; pick the one with minimum motion from prev
         if prev_midis is None:
-            result = voice_chord(root, quality, melody_note=mel, style=style)
+            result = voice_chord(root, quality, melody_note=mel, style=style,
+                                 omit_root=omit_root)
         else:
             # Voice near the centroid of the previous chord; try all
             # inversions (rotations) × octave offsets for minimal motion.
@@ -594,6 +598,7 @@ def voice_progression(
                     try:
                         r = voice_chord(
                             root, quality, melody_note=mel, style=style,
+                            omit_root=omit_root,
                             _center_midi=prev_center + center_offset,
                             _rotation=rotation,
                         )
@@ -608,7 +613,7 @@ def voice_progression(
                 return sum(abs(c_midi[j] - p_midi[j]) for j in range(n))
 
             result = min(candidates, key=_motion_cost) if candidates else voice_chord(
-                root, quality, melody_note=mel, style=style
+                root, quality, melody_note=mel, style=style, omit_root=omit_root
             )
 
         prev_midis = result["midi"]

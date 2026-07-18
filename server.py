@@ -24,6 +24,7 @@ from sequencer.theory import (
 import sequencer.model as seq_model
 import sequencer.engine as engine
 import sequencer.drill as drill
+import sequencer.loop as loop
 from tools import TOOLS, SYSTEM_PROMPT, dispatch_tools
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -109,7 +110,10 @@ def _init_player():
         def note_off(note: int, channel: int = DEFAULT_CHANNEL) -> None:
             port.send(mido.Message("note_off", channel=channel, note=note, velocity=0))
 
-        return play, matches[0], note_on, note_off
+        def program(channel: int, prog: int) -> None:
+            port.send(mido.Message("program_change", channel=channel, program=prog))
+
+        return play, matches[0], note_on, note_off, program
     else:
         return _init_fluidsynth()
 
@@ -155,7 +159,10 @@ def _init_fluidsynth():
     def note_off(note: int, channel: int = DEFAULT_CHANNEL) -> None:
         fs.noteoff(channel, note)
 
-    return play, None, note_on, note_off
+    def program(channel: int, prog: int) -> None:
+        fs.program_select(channel, sfid, 0, prog)
+
+    return play, None, note_on, note_off, program
 
 
 # In-memory registry: note_id → {notes, duration_ms} for replay
@@ -308,8 +315,8 @@ def init_db():
 
 init_db()
 seq_model.init_model(DB_PATH)
-_play, _current_port, _note_on, _note_off = _init_player()
-engine.set_note_fns(_note_on, _note_off, _play, _current_port)
+_play, _current_port, _note_on, _note_off, _program = _init_player()
+engine.set_note_fns(_note_on, _note_off, _play, _current_port, _program)
 
 
 def _init_input_from_settings():
@@ -505,11 +512,11 @@ def get_config():
 
 @app.post("/config")
 def set_config(req: ConfigRequest):
-    global _play, _current_port, _note_on, _note_off
+    global _play, _current_port, _note_on, _note_off, _program
 
     if req.port is None:
-        _play, _current_port, _note_on, _note_off = _init_fluidsynth()
-        engine.set_note_fns(_note_on, _note_off, _play, None)
+        _play, _current_port, _note_on, _note_off, _program = _init_fluidsynth()
+        engine.set_note_fns(_note_on, _note_off, _play, None, _program)
         db_set_setting("midi_out", None)
         return {"ok": True, "current": None}
 
@@ -535,11 +542,15 @@ def set_config(req: ConfigRequest):
     def note_off(note: int, channel: int = DEFAULT_CHANNEL) -> None:
         port.send(mido.Message("note_off", channel=channel, note=note, velocity=0))
 
+    def program(channel: int, prog: int) -> None:
+        port.send(mido.Message("program_change", channel=channel, program=prog))
+
     _play = play
     _current_port = req.port
     _note_on = note_on
     _note_off = note_off
-    engine.set_note_fns(note_on, note_off, play, req.port)
+    _program = program
+    engine.set_note_fns(note_on, note_off, play, req.port, program)
     db_set_setting("midi_out", req.port)
     return {"ok": True, "current": req.port}
 
@@ -1156,7 +1167,80 @@ def get_playing():
 def stop_playback():
     _stop_event.set()
     engine.stop()
+    loop.stop()
     return {"ok": True}
+
+
+# ── Loop transport (Slice A) ──────────────────────────────────────────────────
+
+class LoopChord(BaseModel):
+    symbol: str
+    bars: float | None = None
+    beats: float | None = None
+
+
+class LoopStartRequest(BaseModel):
+    chords: list[LoopChord]
+    tempo_bpm: float = 120.0
+    time_signature: str = "4/4"
+    feel: str = "straight"
+    click: bool = True
+    comp: bool = True
+    bass: bool = True
+    count_in_bars: int = 1
+    comp_style: str = "charleston"
+    voicing_style: str = "close"
+    rootless: bool = False
+    repeats: int | None = None
+
+
+@app.post("/loop/start")
+def loop_start(req: LoopStartRequest):
+    chords = []
+    for c in req.chords:
+        entry: dict = {"symbol": c.symbol}
+        if c.beats is not None:
+            entry["beats"] = c.beats
+        else:
+            entry["bars"] = c.bars if c.bars is not None else 1
+        chords.append(entry)
+
+    config = loop.LoopConfig(
+        chords=chords,
+        tempo_bpm=req.tempo_bpm,
+        time_signature=req.time_signature,
+        feel=req.feel,
+        click=req.click,
+        comp=req.comp,
+        bass=req.bass,
+        count_in_bars=req.count_in_bars,
+        comp_style=req.comp_style,
+        voicing_style=req.voicing_style,
+        rootless=req.rootless,
+        repeats=req.repeats,
+    )
+    try:
+        pos = loop.start(config)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True, "position": pos, "chart": loop.chart_view()}
+
+
+@app.post("/loop/stop")
+def loop_stop():
+    loop.stop()
+    return {"ok": True}
+
+
+@app.get("/loop/position")
+def loop_position():
+    """Poll target for the bar cursor — current bar, beat, chord, and next chord."""
+    return loop.position()
+
+
+@app.get("/loop/chart")
+def loop_chart():
+    return loop.chart_view()
 
 
 ALLOWED_MODELS = {

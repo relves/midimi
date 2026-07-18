@@ -49,6 +49,9 @@ swing/shuffle feel, form position, chord-chart data model, repertoire tracking.
 
 ## Slice A — The Loop Clock (the unlock)
 
+**Status: shipped** — `sequencer/loop.py`, `/loop/*` routes, `tests/test_loop.py`. See the
+Loop transport section of the README for the API.
+
 Everything in the jam spine depends on this, so it ships first and alone.
 
 A looping transport that plays a chord progression in time, forever, until stopped:
