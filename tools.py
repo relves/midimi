@@ -19,6 +19,8 @@ from sequencer.theory import normalize_chord_quality, chord_note_names, build_ch
 from sequencer.midi_io import write_sequence_midi
 import sequencer.model as seq_model
 import sequencer.engine as engine
+import sequencer.charts as charts
+import sequencer.loop as loop
 
 # ── Constants (shared with server.py via import) ──────────────────────────────
 
@@ -144,7 +146,19 @@ Use this exact recipe when asked to arrange a piece as a ballad or multi-voice a
 **Critical rules:**
 - Never hand-construct voicings below the melody — always use `voice_chord` or `voice_progression`.
 - `update_sequence` accepts `bar_edits: [{voice, bar, abc}]` so you can fix one voice's bar without re-emitting the whole piece.
-- Multi-voice ABC format: `V:` declaration lines after `K:`, then `[V:1] bars | [V:2] bars |` etc. Stacked [V:id] lines only — no mid-line [V:] switching."""
+- Multi-voice ABC format: `V:` declaration lines after `K:`, then `[V:1] bars | [V:2] bars |` etc. Stacked [V:id] lines only — no mid-line [V:] switching.
+
+## Backing tracks and forms
+
+When the user wants something to **play over** — "give me a blues in F", "loop a ii-V-I", "I want to practise my comping" — use **start_chart_loop**, never a one-shot sequence. The whole point is that it keeps going while they play, with a count-in, a click, and a bass they can hear the form against.
+
+- Reach for the built-ins first: `blues-12-bar`, `blues-12-bar-quick-change`, `blues-12-bar-slow`, `ii-v-i`. Call `list_charts` if you need to check.
+- **Key and mode are parameters, not different charts.** The same 12-bar chart transposes to any key and renders as triads or as all dominants — `mode: 'triad'` when the user is learning the shape of the form, `mode: 'dominant7'` for a real blues.
+- "Slow blues" means a slower tempo (around 60) and usually `blues-12-bar-slow`, which spells out the turnaround; it does not mean a different form.
+- Blues wants `feel: 'shuffle'` unless the user says straight.
+- Write ad-hoc charts in **roman numerals** (`slots: ['I', 'IV', 'V7']`), not chord symbols — numerals transpose exactly and give the user the roman-numeral overlay for free. Only use literal symbols when the harmony genuinely isn't diatonic to one key.
+- Use **show_chart** when they want to read the form rather than hear it. It returns both symbols and numerals, so you can answer "which bar is the IV?" without a second call.
+- Call **stop_loop** when they're done, or before starting something different."""
 
 # ── Tool schemas ──────────────────────────────────────────────────────────────
 
@@ -620,6 +634,99 @@ TOOLS = [
             "required": ["chords"],
         },
     },
+    {
+        "name": "list_charts",
+        "description": (
+            "List the built-in chord charts (12-bar blues and friends) with their bar counts and "
+            "default tempo, feel and mode. Call this when the user asks what forms are available, "
+            "or before start_chart_loop if you're unsure of a chart id."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "show_chart",
+        "description": (
+            "Render a chord chart as a bar-by-bar grid without playing it. Use this when the user "
+            "wants to *read* a form — 'show me a blues in Bb', 'what are the chords in a 12-bar' — "
+            "or to check a chart before looping it. Every bar comes back with both its chord symbol "
+            "and its roman numeral, so you can answer 'where's the IV?' from one call."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chart_id": {
+                    "type": "string",
+                    "description": "Built-in chart id, e.g. 'blues-12-bar', 'blues-12-bar-quick-change', 'blues-12-bar-slow', 'ii-v-i'.",
+                },
+                "chart": {
+                    "type": "object",
+                    "description": (
+                        "An ad-hoc chart instead of a built-in. Shape: {name, key, time_signature, "
+                        "slots: ['I', 'IV', ...]}. Slot entries may be roman numerals ('I', 'ii7', "
+                        "'bVII') or literal chord symbols ('F7', 'Bb'); numerals are strongly "
+                        "preferred because they transpose exactly. Use {slots, repeat, label} "
+                        "sections for forms with repeats."
+                    ),
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Transpose to this key, e.g. 'F', 'Bb', 'C'. Omit to use the chart's own key.",
+                },
+                "mode": {
+                    "type": "string",
+                    "description": (
+                        "How to quality the chords over the same form. 'triad' for plain major/minor "
+                        "triads (week 2), 'dominant7' for the all-dominant blues (week 3), 'seventh' "
+                        "for diatonic sevenths, 'as_written' to leave the chart alone."
+                    ),
+                    "enum": ["as_written", "triad", "dominant7", "seventh"],
+                },
+                "roman": {
+                    "type": "boolean",
+                    "description": "Show the roman-numeral overlay alongside each chord. Default true.",
+                    "default": True,
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "start_chart_loop",
+        "description": (
+            "Loop a chord chart in time, forever, until stopped — piano comp, bass and a click, "
+            "with a count-in. This is the right tool for any 'play me a blues in F', 'give me a "
+            "slow blues to solo over', 'loop a ii-V-I' request: the user practises *over* it, so "
+            "it must keep going rather than play once. Never build a one-shot sequence for a "
+            "backing track. Returns the chart grid so you can tell the user what's coming."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chart_id": {"type": "string", "description": "Built-in chart id, e.g. 'blues-12-bar'."},
+                "chart": {"type": "object", "description": "An ad-hoc chart, same shape as show_chart's 'chart'."},
+                "key": {"type": "string", "description": "Key to play in, e.g. 'F', 'C', 'Bb'."},
+                "mode": {
+                    "type": "string",
+                    "enum": ["as_written", "triad", "dominant7", "seventh"],
+                    "description": "Chord qualities over the form: 'triad', 'dominant7', 'seventh', or 'as_written'.",
+                },
+                "tempo_bpm": {"type": "number", "description": "Tempo. Omit for the chart's default. A 'slow blues' is around 60."},
+                "feel": {"type": "string", "enum": ["straight", "shuffle"], "description": "Eighth-note feel. Blues usually wants 'shuffle'."},
+                "click": {"type": "boolean", "default": True, "description": "Metronome click on the beat."},
+                "comp": {"type": "boolean", "default": True, "description": "Piano comp."},
+                "bass": {"type": "boolean", "default": True, "description": "Root-note bass."},
+                "rootless": {"type": "boolean", "default": False, "description": "Omit roots from the comp voicings, so the user can practise rootless voicings against the bass."},
+                "count_in_bars": {"type": "integer", "default": 1, "description": "Bars of click before the loop starts."},
+                "repeats": {"type": "integer", "description": "Stop after this many times through the form. Omit to loop until stopped."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "stop_loop",
+        "description": "Stop the running loop. Use when the user says stop, that's enough, or asks for something else to play.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
 ]
 
 
@@ -835,6 +942,17 @@ def _sequence_report(sequence: dict, *, warnings: list[str] | None = None) -> st
 
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────
+
+def _resolve_chart_arg(inp: dict) -> charts.Chart:
+    """The chart a chart tool call refers to — a built-in id, or an inline spec."""
+    chart_id = inp.get("chart_id")
+    if chart_id:
+        return charts.get_chart(chart_id)
+    spec = inp.get("chart")
+    if spec:
+        return charts.chart_from_spec(spec)
+    raise ValueError("Give either 'chart_id' or 'chart'. Call list_charts to see the built-ins.")
+
 
 def dispatch_tools(
     pending_tools: list[dict],
@@ -1393,3 +1511,59 @@ def dispatch_tools(
                 lines.append(f"  {v['symbol']} ({v['beats']} beats): {', '.join(v['notes'])}  →  {v['abc']}")
             lines += ["", f"ABC line for [V:2]:", result["abc_line"]]
             yield _ok("\n".join(lines))
+
+        elif name == "list_charts":
+            lines = ["Built-in charts:"]
+            for entry in charts.list_charts():
+                lines.append(
+                    f"  {entry['id']} — {entry['name']}, {entry['bars']} bars in "
+                    f"{entry['time_signature']}, default key {entry['key']}, "
+                    f"{entry['default_tempo_bpm']:g} bpm {entry['default_feel']}, "
+                    f"mode {entry['default_mode']}"
+                )
+                if entry["description"]:
+                    lines.append(f"      {entry['description']}")
+            lines += ["", f"Modes: {', '.join(charts.MODES)}"]
+            yield _ok("\n".join(lines))
+
+        elif name in ("show_chart", "start_chart_loop"):
+            try:
+                chart = _resolve_chart_arg(inp)
+                rendered = charts.render_chart(chart, key=inp.get("key"), mode=inp.get("mode"))
+            except (KeyError, ValueError) as e:
+                yield _err(f"Chart error: {e}")
+                continue
+
+            grid = charts.chart_text(rendered, roman=bool(inp.get("roman", True)))
+
+            if name == "show_chart":
+                yield _ok(grid)
+                continue
+
+            config = loop.LoopConfig(
+                chords=charts.to_loop_chords(rendered),
+                tempo_bpm=float(inp.get("tempo_bpm") or rendered["tempo_bpm"]),
+                time_signature=rendered["time_signature"],
+                feel=inp.get("feel") or rendered["feel"],
+                click=bool(inp.get("click", True)),
+                comp=bool(inp.get("comp", True)),
+                bass=bool(inp.get("bass", True)),
+                count_in_bars=int(inp.get("count_in_bars", 1)),
+                rootless=bool(inp.get("rootless", False)),
+                repeats=inp.get("repeats"),
+                key=rendered["key"],
+            )
+            try:
+                loop.start(config)
+            except (ValueError, RuntimeError) as e:
+                yield _err(f"Could not start the loop: {e}")
+                continue
+
+            tail = "looping until stopped" if config.repeats is None else f"{config.repeats}x through"
+            yield _ok(
+                f"Loop running — {config.tempo_bpm:g} bpm, {config.feel} feel, {tail}.\n\n{grid}"
+            )
+
+        elif name == "stop_loop":
+            loop.stop()
+            yield _ok("Loop stopped.")

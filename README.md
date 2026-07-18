@@ -103,6 +103,51 @@ Bar and beat are reported on the straight grid even under shuffle — the feel c
 notes land, not where you count. The comp, bass, and click use MIDI channels 1, 2, and 9,
 so ordinary chord playback (channel 0) still works over a running loop.
 
+## Chord charts
+
+Charts are the *form* layer over the loop: bars, chords, repeats, and a key. They are stored
+as **roman numerals plus a key**, not as chord symbols, which is what makes them transposable
+to any key with correct spelling (the IV of G♭ is C♭, not B) and what makes the roman-numeral
+overlay free — every rendered bar carries both its symbol and its numeral.
+
+```bash
+curl 'localhost:8000/charts/blues-12-bar?key=Bb&mode=triad'
+curl -X POST localhost:8000/charts/loop -H 'content-type: application/json' \
+  -d '{"chart_id": "blues-12-bar-slow", "key": "F", "mode": "dominant7", "tempo_bpm": 62}'
+```
+
+| Endpoint | What it does |
+|---|---|
+| `GET /charts` | The built-in charts and the available modes |
+| `GET /charts/{id}?key=&mode=` | Render a chart into concrete bars, symbols *and* numerals |
+| `POST /charts/loop` | Render a chart and start the loop on it, in one call |
+
+Built-ins: `blues-12-bar`, `blues-12-bar-quick-change`, `blues-12-bar-slow`, `ii-v-i`.
+
+**Modes re-quality the same form**, so the week-2 triad blues and the week-3 all-dominant
+blues are provably the same twelve bars rather than two charts that can drift:
+
+| Mode | Bar 1 of a blues in F |
+|---|---|
+| `triad` | `F` |
+| `dominant7` | `F7` |
+| `seventh` | `Fmaj7` (but V stays dominant) |
+| `as_written` | whatever the chart says |
+
+`POST /charts/loop` also accepts an inline `chart` instead of a `chart_id`, so a chart can be
+authored on the fly. Slots may be roman numerals (`"I"`, `"ii7"`, `"bVII"`) or literal chord
+symbols (`"F7"`); numerals are preferred because they transpose exactly. Use sections for
+repeats:
+
+```json
+{"chart": {"name": "Rhythm A", "key": "C",
+           "sections": [{"slots": ["I", "vi", "ii", "V"], "repeat": 2}]},
+ "key": "Eb", "mode": "seventh"}
+```
+
+The chat agent has `list_charts`, `show_chart`, `start_chart_loop` and `stop_loop`, so
+*"give me a slow blues in F"* starts a running loop rather than a one-shot playback.
+
 ## Usage tips
 
 - Ask about any music theory concept — chord types, scales, intervals, progressions, modes

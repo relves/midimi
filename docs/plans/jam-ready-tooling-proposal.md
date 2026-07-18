@@ -74,6 +74,13 @@ voicings, Wk5 rhythm and space, Wk6 rootless comping. Six of the eight weeks.
 
 ## Slice B — Charts & the 12-Bar Blues
 
+**Status: shipped** — `sequencer/charts.py`, `/charts/*` routes, the `list_charts` /
+`show_chart` / `start_chart_loop` / `stop_loop` chat tools, `tests/test_charts.py`. See the
+Chord charts section of the README. One deviation from the sketch below: charts are stored
+as roman numerals rather than chord symbols, which is what collapses "transposable",
+"triad vs dominant-7 mode" and "roman-numeral overlay" into a single rendering function.
+Still open: no UI — like Slice A, this ships as API plus chat surface only.
+
 A chord-chart data model — bars, chord symbols, repeats, key — that feeds Slice A.
 
 - Ship the 12-bar blues as a built-in, transposable to any key (the plan calls out F, C, B♭).

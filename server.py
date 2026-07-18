@@ -25,6 +25,7 @@ import sequencer.model as seq_model
 import sequencer.engine as engine
 import sequencer.drill as drill
 import sequencer.loop as loop
+import sequencer.charts as charts
 from tools import TOOLS, SYSTEM_PROMPT, dispatch_tools
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -1243,6 +1244,90 @@ def loop_position():
 @app.get("/loop/chart")
 def loop_chart():
     return loop.chart_view()
+
+
+# ── Charts (Slice B) ──────────────────────────────────────────────────────────
+
+@app.get("/charts")
+def charts_list():
+    """The built-in forms. Each is transposable to any key and renderable in any mode."""
+    return {"charts": charts.list_charts(), "modes": list(charts.MODES)}
+
+
+@app.get("/charts/{chart_id}")
+def charts_render(chart_id: str, key: str | None = None, mode: str | None = None):
+    """Render a built-in chart into concrete bars.
+
+    Every slot carries both `symbol` and `numeral`, so the roman-numeral overlay is a
+    display toggle rather than a second request.
+    """
+    try:
+        chart = charts.get_chart(chart_id)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    try:
+        return charts.render_chart(chart, key=key, mode=mode)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+class ChartLoopRequest(BaseModel):
+    """Start the loop from a chart — a built-in by id, or one the caller supplies."""
+    chart_id: str | None = None
+    chart: dict | None = None
+    key: str | None = None
+    mode: str | None = None
+    tempo_bpm: float | None = None
+    feel: str | None = None
+    click: bool = True
+    comp: bool = True
+    bass: bool = True
+    count_in_bars: int = 1
+    comp_style: str = "charleston"
+    voicing_style: str = "close"
+    rootless: bool = False
+    repeats: int | None = None
+
+
+def _resolve_chart(req: ChartLoopRequest) -> charts.Chart:
+    if req.chart_id:
+        return charts.get_chart(req.chart_id)
+    if req.chart:
+        return charts.chart_from_spec(req.chart)
+    raise ValueError("Give either 'chart_id' or 'chart'")
+
+
+@app.post("/charts/loop")
+def charts_loop(req: ChartLoopRequest):
+    """Render a chart and hand it to the loop transport as one call."""
+    try:
+        chart = _resolve_chart(req)
+        rendered = charts.render_chart(chart, key=req.key, mode=req.mode)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    config = loop.LoopConfig(
+        chords=charts.to_loop_chords(rendered),
+        tempo_bpm=req.tempo_bpm if req.tempo_bpm is not None else rendered["tempo_bpm"],
+        time_signature=rendered["time_signature"],
+        feel=req.feel or rendered["feel"],
+        click=req.click,
+        comp=req.comp,
+        bass=req.bass,
+        count_in_bars=req.count_in_bars,
+        comp_style=req.comp_style,
+        voicing_style=req.voicing_style,
+        rootless=req.rootless,
+        repeats=req.repeats,
+        key=rendered["key"],
+    )
+    try:
+        pos = loop.start(config)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True, "position": pos, "chart": rendered, "loop_chart": loop.chart_view()}
 
 
 ALLOWED_MODELS = {
