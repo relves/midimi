@@ -70,6 +70,7 @@ class LoopConfig:
     count_in_bars: int = 1
     comp_style: str = "charleston"  # "charleston" | "pad"
     voicing_style: str = "close"    # passed to voice_progression
+    key: str | None = None          # key signature; spelling only, e.g. "F", "d minor"
     rootless: bool = False          # omit roots from comp voicings (Wk6)
     repeats: int | None = None      # None = loop forever, else stop after N cycles
 
@@ -213,6 +214,7 @@ def render(config: LoopConfig) -> RenderedLoop:
         [{"symbol": s["symbol"], "beats": s["beats"]} for s in chart],
         style=config.voicing_style,
         omit_root=config.rootless,
+        key=config.key,
     )
     voicings = voiced["voicings"]
 

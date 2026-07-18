@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import pytest
 from pathlib import Path
 from sequencer.abc import parse_abc, to_abc, ABCParseError, per_bar_report
-from sequencer.theory import voice_chord, voice_progression, _LIL_THRESHOLD
+from sequencer.theory import voice_chord, voice_progression, key_prefers_flats, _LIL_THRESHOLD
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5.1 Multi-voice ABC
@@ -281,6 +281,53 @@ class TestVoiceProgression:
         r = voice_progression(chords)
         v = r["voicings"][0]
         assert all(k in v for k in ("symbol", "beats", "notes", "midi", "abc"))
+
+
+class TestVoicingSpelling:
+    """Voicings must spell each tone from its interval, not from a global flat/sharp
+    flag keyed off the chord root."""
+
+    @pytest.mark.parametrize("root,quality,expected", [
+        # The bug that opened this: C7's b7 is Bb, even though C is not a flat root.
+        ("C", "dominant7", {"Bb"}),
+        # Mixed accidentals inside one chord — no single boolean can produce these.
+        ("C", "dominant7alt", {"Bb", "D#", "Ab"}),
+        ("C", "dominant7#9", {"Bb", "D#"}),
+        ("D", "halfdiminished7", {"Ab"}),
+        ("A", "dominant7alt", {"C#", "B#", "F"}),
+    ])
+    def test_chord_tones_spelled_by_interval(self, root, quality, expected):
+        names = voice_chord(root, quality)["notes"]
+        pitches = {n.rstrip("-0123456789") for n in names}
+        assert expected <= pitches, f"{root}{quality} voiced as {names}"
+
+    def test_key_respells_enharmonic_root(self):
+        """A#7 in a flat key is a Bb7 on the page."""
+        assert voice_chord("A#", "dominant7", key="F")["notes"][0].startswith("Bb")
+        assert voice_chord("Bb", "dominant7", key="B")["notes"][0].startswith("A#")
+
+    def test_key_does_not_change_pitch(self):
+        """Key is a spelling concern only — MIDI must be identical."""
+        plain = voice_chord("C", "dominant7")
+        keyed = voice_chord("C", "dominant7", key="F")
+        assert plain["midi"] == keyed["midi"]
+
+    def test_blues_in_f_spells_flats_throughout(self):
+        chords = [{"symbol": s, "beats": 4} for s in
+                  ["F7", "Bb7", "F7", "F7", "Bb7", "Bb7",
+                   "F7", "F7", "C7", "Bb7", "F7", "C7"]]
+        r = voice_progression(chords, key="F")
+        for v in r["voicings"]:
+            assert not any("#" in n for n in v["notes"]), \
+                f"{v['symbol']} voiced with a sharp in F: {v['notes']}"
+
+    @pytest.mark.parametrize("key,flats", [
+        ("F", True), ("Bb major", True), ("d minor", True), ("Dm", True),
+        ("C", False), ("G", False), ("a minor", False), ("F# major", False),
+        ("", None), (None, None),
+    ])
+    def test_key_prefers_flats(self, key, flats):
+        assert key_prefers_flats(key) is flats
 
 
 # ─────────────────────────────────────────────────────────────────────────────

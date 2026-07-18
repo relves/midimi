@@ -1192,6 +1192,7 @@ class LoopStartRequest(BaseModel):
     voicing_style: str = "close"
     rootless: bool = False
     repeats: int | None = None
+    key: str | None = None
 
 
 @app.post("/loop/start")
@@ -1218,6 +1219,7 @@ def loop_start(req: LoopStartRequest):
         voicing_style=req.voicing_style,
         rootless=req.rootless,
         repeats=req.repeats,
+        key=req.key,
     )
     try:
         pos = loop.start(config)

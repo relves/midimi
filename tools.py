@@ -537,6 +537,10 @@ TOOLS = [
                     "description": "Drop the root from the voicing (bass voice has it). Default false.",
                     "default": False,
                 },
+                "key": {
+                    "type": "string",
+                    "description": "Key the chord sits in, e.g. 'F', 'Bb major', 'd minor'. Affects note-name spelling only (a chord in a flat key spells accidentals as flats).",
+                },
             },
             "required": ["root", "quality"],
         },
@@ -607,6 +611,10 @@ TOOLS = [
                     "description": "'close' | 'drop2' | 'shell' | 'spread'. Default 'close'.",
                     "enum": ["close", "drop2", "shell", "spread"],
                     "default": "close",
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Key the progression sits in, e.g. 'F', 'Bb major', 'd minor'. Affects note-name spelling only.",
                 },
             },
             "required": ["chords"],
@@ -1228,9 +1236,11 @@ def dispatch_tools(
             register = inp.get("register", "mid")
             style = inp.get("style", "close")
             omit_root = bool(inp.get("omit_root", False))
+            key = inp.get("key")
             try:
                 result = _voice_chord(root, quality, melody_note=melody_note,
-                                      register=register, style=style, omit_root=omit_root)
+                                      register=register, style=style, omit_root=omit_root,
+                                      key=key)
             except Exception as e:
                 yield _err(f"voice_chord error: {e}")
                 continue
@@ -1303,7 +1313,8 @@ def dispatch_tools(
                 yield _err(anchor_error)
                 continue
             try:
-                vp = _voice_progression(chords_arg, style=style)
+                vp = _voice_progression(chords_arg, style=style,
+                                        key=melody_seq.get("key"))
             except Exception as e:
                 yield _err(f"Voicing error: {e}")
                 continue
@@ -1371,8 +1382,9 @@ def dispatch_tools(
         elif name == "voice_progression":
             chords = inp.get("chords", [])
             style = inp.get("style", "close")
+            key = inp.get("key")
             try:
-                result = _voice_progression(chords, style=style)
+                result = _voice_progression(chords, style=style, key=key)
             except Exception as e:
                 yield _err(f"voice_progression error: {e}")
                 continue

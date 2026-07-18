@@ -71,6 +71,15 @@ CHORD_INTERVALS: dict[str, list[int]] = {
 
 _FLAT_ROOTS = {"F", "Bb", "Eb", "Ab", "Db", "Gb", "Cb", "Fb"}
 
+# Enharmonic partners for the five black keys, used to respell a chord root so it
+# agrees with the surrounding key signature (A#7 in a blues in F -> Bb7).
+_ENHARMONIC_PARTNER: dict[str, str] = {
+    "A#": "Bb", "Bb": "A#", "C#": "Db", "Db": "C#", "D#": "Eb",
+    "Eb": "D#", "F#": "Gb", "Gb": "F#", "G#": "Ab", "Ab": "G#",
+}
+
+_LETTER_PC: dict[str, int] = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
+
 NOTE_NAMES: dict[str, int] = {
     "C": 0, "B#": 0, "C#": 1, "Db": 1, "D": 2, "D#": 3, "Eb": 3,
     "E": 4, "Fb": 4, "F": 5, "E#": 5, "F#": 6, "Gb": 6, "G": 7,
@@ -406,6 +415,102 @@ def midi_note_name(n: int, prefer_flats: bool = False) -> str:
     return _midi_to_name(n, prefer_flats)
 
 
+def key_prefers_flats(key: str | None) -> bool | None:
+    """Does `key` use a flat signature?  None when the key gives no opinion.
+
+    Accepts "F", "Bb major", "d minor", "Dm". Minor keys are resolved through
+    their relative major, so D minor (one flat) prefers flats even though a bare
+    D root would not.
+    """
+    if not key:
+        return None
+    raw = str(key).strip().replace("♭", "b").replace("♯", "#")
+    if not raw:
+        return None
+    parts = raw.split()
+    tonic = parts[0]
+    rest = " ".join(parts[1:]).lower()
+    # "Dm" / "dmin" with no space, versus "D minor".
+    is_minor = rest.startswith("m") and not rest.startswith("maj")
+    if not is_minor:
+        suffix = tonic[2:] if len(tonic) > 1 and tonic[1] in "#b" else tonic[1:]
+        if suffix.lower().startswith("m") and not suffix.lower().startswith("maj"):
+            is_minor = True
+            tonic = tonic[: len(tonic) - len(suffix)]
+    tonic = tonic[:1].upper() + tonic[1:]
+
+    accidental = tonic[1:]
+    if accidental.startswith("b"):
+        return True
+    if accidental.startswith("#"):
+        return False
+
+    if is_minor:
+        # Relative major sits a minor 3rd above; that's the key we know the
+        # signature of. Only naturals reach here, so a lookup is enough.
+        relative_major = {"A": "C", "B": "D", "C": "Eb", "D": "F",
+                          "E": "G", "F": "Ab", "G": "Bb"}.get(tonic)
+        tonic = relative_major or tonic
+        if tonic.endswith("b"):
+            return True
+
+    return tonic in _FLAT_ROOTS
+
+
+def _respell_root_for_key(root: str, prefer_flats: bool | None) -> str:
+    """Swap a black-key root for its enharmonic partner when the key disagrees."""
+    if prefer_flats is None:
+        return root
+    partner = _ENHARMONIC_PARTNER.get(root)
+    if partner is None:
+        return root
+    if prefer_flats and root.endswith("#"):
+        return partner
+    if not prefer_flats and root.endswith("b"):
+        return partner
+    return root
+
+
+def _chord_pc_spellings(root: str, quality: str) -> dict[int, str]:
+    """Map each pitch class in the chord to its interval-derived spelling.
+
+    `chord_note_names` already knows that C7alt is C E Bb D# Ab -- flats and
+    sharps mixed inside one chord. Voicings reduce to pitch classes and would
+    otherwise re-derive names from MIDI under a single flat/sharp flag, which no
+    boolean can get right. Carrying this map through the reduction preserves the
+    per-tone spelling.
+    """
+    try:
+        names = chord_note_names(root, quality, octave=4)
+    except Exception:
+        return {}
+    spellings: dict[int, str] = {}
+    for name in names:
+        m = _PITCH_RE.match(name)
+        if not m:
+            continue
+        letter, acc, _ = m.groups()
+        pitch_name = f"{letter.upper()}{_normalize_acc(acc)}"
+        pc = NOTE_NAMES.get(pitch_name)
+        if pc is not None:
+            spellings.setdefault(pc, pitch_name)
+    return spellings
+
+
+def _name_midi_spelled(midi: int, spellings: dict[int, str], prefer_flats: bool) -> str:
+    """Name a MIDI note using the chord's own spelling, falling back to the flag."""
+    pitch_name = spellings.get(midi % 12)
+    if pitch_name is None:
+        return _midi_to_name(midi, prefer_flats)
+    accidental = pitch_name[1:]
+    alter = accidental.count("#") - accidental.count("b")
+    # Same octave formula as _spell_interval_named: the *unwrapped* pitch value
+    # (Cb = -1, B# = 12) is what puts B#3 and Cb5 in the right octave.
+    named_pc_value = _LETTER_PC[pitch_name[0]] + alter
+    octave = (midi - named_pc_value) // 12 - 1
+    return f"{pitch_name}{octave}"
+
+
 # ── Low-interval limits (LIL) ─────────────────────────────────────────────────
 # Each entry: (interval_semitones, min_midi_for_lower_note)
 # Below the min, the lower note must be pushed up an octave.
@@ -484,6 +589,7 @@ def voice_chord(
     register: str = "mid",
     style: str = "close",
     omit_root: bool = False,
+    key: str | None = None,
     _center_midi: int | None = None,
     _rotation: int = 0,
 ) -> dict:
@@ -504,6 +610,11 @@ def voice_chord(
         "close" | "drop2" | "shell" | "spread"
     omit_root : bool
         Drop the root (bass voice has it); keeps 3rd and 7th.
+    key : str | None
+        Key signature the chord sits in, e.g. "F", "Bb major", "d minor". Only
+        affects spelling: it respells a black-key root to match the signature and
+        decides accidentals for non-chord tones. Chord tones are spelled from
+        their intervals regardless.
 
     Returns
     -------
@@ -521,10 +632,14 @@ def voice_chord(
     if melody_note:
         _, _, melody_midi = parse_pitch(melody_note)
 
-    prefer_flats = root in _FLAT_ROOTS
+    key_flats = key_prefers_flats(key)
+    root = _respell_root_for_key(root, key_flats)
+    prefer_flats = key_flats if key_flats is not None else (root in _FLAT_ROOTS)
     root_pc = NOTE_NAMES.get(root)
     if root_pc is None:
         raise ValueError(f"Unknown root: {root!r}")
+
+    spellings = _chord_pc_spellings(root, quality)
 
     # Build tone pitch-classes in chord order
     tone_pcs = [(root_pc + s) % 12 for s in intervals]
@@ -601,7 +716,7 @@ def voice_chord(
             placed[-1] -= 12
             placed.sort()
 
-    note_names = [_midi_to_name(m, prefer_flats) for m in placed]
+    note_names = [_name_midi_spelled(m, spellings, prefer_flats) for m in placed]
     abc_inner = ''.join(_midi_to_abc_token(m, n) for m, n in zip(placed, note_names))
 
     return {
@@ -616,6 +731,7 @@ def voice_progression(
     melody: list[str | None] | None = None,
     style: str = "close",
     omit_root: bool = False,
+    key: str | None = None,
 ) -> dict:
     """Voice a chord progression with minimal-motion voice leading.
 
@@ -630,6 +746,9 @@ def voice_progression(
         "close" | "drop2" | "shell" | "spread"
     omit_root : bool
         Drop the root from every voicing (rootless comping over a bass line).
+    key : str | None
+        Key signature the progression sits in, e.g. "F", "Bb major", "d minor".
+        Spelling only -- see `voice_chord`.
 
     Returns
     -------
@@ -654,7 +773,7 @@ def voice_progression(
         # Try all inversions/registers; pick the one with minimum motion from prev
         if prev_midis is None:
             result = voice_chord(root, quality, melody_note=mel, style=style,
-                                 omit_root=omit_root)
+                                 omit_root=omit_root, key=key)
         else:
             # Voice near the centroid of the previous chord; try all
             # inversions (rotations) × octave offsets for minimal motion.
@@ -667,7 +786,7 @@ def voice_progression(
                     try:
                         r = voice_chord(
                             root, quality, melody_note=mel, style=style,
-                            omit_root=omit_root,
+                            omit_root=omit_root, key=key,
                             _center_midi=prev_center + center_offset,
                             _rotation=rotation,
                         )
@@ -682,7 +801,8 @@ def voice_progression(
                 return sum(abs(c_midi[j] - p_midi[j]) for j in range(n))
 
             result = min(candidates, key=_motion_cost) if candidates else voice_chord(
-                root, quality, melody_note=mel, style=style, omit_root=omit_root
+                root, quality, melody_note=mel, style=style, omit_root=omit_root,
+                key=key,
             )
 
         prev_midis = result["midi"]
