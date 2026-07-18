@@ -56,6 +56,17 @@ CHORD_INTERVALS: dict[str, list[int]] = {
     "minor6":      [0, 3, 7, 9],
     "dominant11":  [0, 4, 7, 10, 14, 17],
     "dominant13":  [0, 4, 7, 10, 14, 17, 21],
+    "minor11":     [0, 3, 7, 10, 14, 17],
+    # Altered / extended qualities. music21 reports these as a plain kind plus a
+    # chordStepModification, so we resolve them by suffix instead (see
+    # _QUALITY_ALIASES) rather than letting the alteration get dropped.
+    "dominant7#5":  [0, 4, 8, 10],
+    "dominant7#9":  [0, 4, 7, 10, 15],
+    "dominant7b13": [0, 4, 7, 10, 20],
+    "dominant7alt": [0, 4, 10, 15, 20],   # R 3 b7 #9 b13; 5th omitted
+    "dominant7sus4": [0, 5, 7, 10],
+    "major7#11":   [0, 4, 7, 11, 18],
+    "major69":     [0, 4, 7, 9, 14],
 }
 
 _FLAT_ROOTS = {"F", "Bb", "Eb", "Ab", "Db", "Gb", "Cb", "Fb"}
@@ -114,6 +125,37 @@ _QUALITY_ALIASES: dict[str, str] = {
     "perfect5": "P5", "perf5": "P5",
     "minor6": "m6", "major6dyad": "M6",
     "minor7dyad": "m7", "major7dyad": "M7",
+
+    # Altered / extended chord-symbol suffixes. These are resolved here rather
+    # than by music21, which reports them as a base chordKind plus a
+    # chordStepModification and so loses the alteration when we read only the
+    # kind. Keys are post-normalization: lower-cased, with spaces, "-" and "_"
+    # already stripped (so "m7-5" arrives as "m75").
+    "m7b5": "halfdiminished7", "m7(b5)": "halfdiminished7",
+    "min7b5": "halfdiminished7", "mi7b5": "halfdiminished7",
+    "minor7b5": "halfdiminished7", "m7flat5": "halfdiminished7",
+    "min7flat5": "halfdiminished7", "m75": "halfdiminished7",
+    "halfdiminished": "halfdiminished7", "halfdim": "halfdiminished7",
+    "halfdiminished7": "halfdiminished7", "hdim7": "halfdiminished7",
+    "ø": "halfdiminished7", "ø7": "halfdiminished7",
+
+    "7#5": "dominant7#5", "7sharp5": "dominant7#5", "dom7#5": "dominant7#5",
+    "7+5": "dominant7#5", "7+": "dominant7#5",
+    "7#9": "dominant7#9", "7sharp9": "dominant7#9", "dom7#9": "dominant7#9",
+    "7b13": "dominant7b13", "7flat13": "dominant7b13",
+    "7alt": "dominant7alt", "alt": "dominant7alt", "7altered": "dominant7alt",
+    "7sus4": "dominant7sus4", "7sus": "dominant7sus4",
+    "dom7sus4": "dominant7sus4",
+
+    "maj7#11": "major7#11", "ma7#11": "major7#11", "major7#11": "major7#11",
+    "6/9": "major69", "69": "major69", "maj69": "major69",
+    "maj6/9": "major69", "major6/9": "major69",
+
+    "mmaj7": "minormajor7", "minmaj7": "minormajor7", "mimaj7": "minormajor7",
+    "m(maj7)": "minormajor7", "minormaj7": "minormajor7",
+    "maj9": "major9", "ma9": "major9",
+    "sus": "sus4", "5": "P5",
+    "m11": "minor11", "min11": "minor11", "minor11": "minor11",
 }
 
 # Map from semitone count to the canonical diatonic interval name (music21 notation).
@@ -137,7 +179,10 @@ _SEMITONE_TO_INTERVAL_NAME: dict[int, str] = {
     12: "P8",
     13: "m9",
     14: "M9",
+    15: "A9",   # #9 (spelled as augmented 9th in altered dominants)
     17: "P11",
+    18: "A11",  # #11
+    20: "m13",  # b13
     21: "M13",
 }
 
@@ -148,6 +193,8 @@ _QUALITY_INTERVAL_OVERRIDE: dict[str, dict[int, str]] = {
     "diminished7":     {6: "d5", 9: "M6"},  # spelled as M6 for readability (old code convention)
     "augmented":       {8: "A5"},
     "augmented7":      {8: "A5"},
+    "dominant7#5":     {8: "A5"},
+    "dominant7alt":    {8: "A5"},
 }
 
 _PITCH_RE = re.compile(r"^([A-Ga-g])([#b♯♭]?)(-?\d+)$")
@@ -164,24 +211,46 @@ def normalize_chord_quality(quality: str, root: str | None = None) -> str:
         .replace("♭", "b").replace("♯", "#")
         .replace(" ", "").replace("-", "").replace("_", "")
     )
+    # `quality` is sometimes handed to us as a whole chord symbol ("Cm7"), so we
+    # also consider the string with a leading root stripped. Try the unstripped
+    # form first: suffixes like "alt" or "b13" begin with a note letter and would
+    # otherwise be mangled into "lt" / "13" when the root happens to be A or B.
+    # `quality` is sometimes handed to us as a whole chord symbol ("Cm7"), so we
+    # also consider the string with a leading root stripped. Both forms are tried
+    # everywhere, unstripped first, because stripping is ambiguous in both
+    # directions: "alt"/"b13" begin with a note letter and would be mangled into
+    # "lt"/"13" under root A or B, while "dim7" under root D would become "im7".
+    candidates = [normalized]
+    m21_suffixes = [raw]
     if root:
         normalized_root = root.lower().replace("♭", "b").replace("♯", "#")
         if normalized.startswith(normalized_root):
-            normalized = normalized[len(normalized_root):]
+            candidates.append(normalized[len(normalized_root):])
+        if raw.lower().startswith(normalized_root):
+            m21_suffixes.append(raw[len(normalized_root):])
 
-    alias = _QUALITY_ALIASES.get(normalized)
-    if alias:
-        return alias
+    for candidate in candidates:
+        if candidate in CHORD_INTERVALS:
+            return candidate
+        alias = _QUALITY_ALIASES.get(candidate)
+        if alias:
+            return alias
 
-    # Try music21 ChordSymbol parsing for unrecognized quality strings.
-    try:
-        cs = _parse_chord_symbol(f"{root or 'C'}{raw}")
-        kind = cs.chordKind
-        canonical = _M21_KIND_TO_QUALITY.get(kind)
-        if canonical:
+    # Try music21 ChordSymbol parsing for unrecognized quality strings. Parse
+    # against a neutral C root: music21 reads a flat root followed by a degree
+    # ("Bb13") as B plus a b13 alteration, which corrupts both root and quality.
+    for suffix in m21_suffixes:
+        try:
+            cs = _parse_chord_symbol(f"C{suffix}")
+        except Exception:
+            continue
+        canonical = _M21_KIND_TO_QUALITY.get(cs.chordKind)
+        # chordStepModifications hold alterations (b5, #9, b13, ...) that the
+        # chordKind alone does not express. If we have any left over, the kind is
+        # a lossy answer -- reject it and let the caller fail loudly on an
+        # unknown quality rather than silently voicing the wrong chord.
+        if canonical and not cs.chordStepModifications:
             return canonical
-    except Exception:
-        pass
 
     return normalized
 
@@ -665,10 +734,12 @@ def _parse_chord_symbol_to_root_quality(symbol: str) -> tuple[str, str]:
             dyad_keys = {k for k, v in CHORD_INTERVALS.items() if len(v) <= 2}
             if quality in dyad_keys and quality_str:
                 try:
-                    cs = _parse_chord_symbol(f"{candidate_root}{quality_str}")
+                    # Neutral C root: a flat root followed by a degree ("Bb13")
+                    # parses as B plus a b13 alteration and corrupts both halves.
+                    cs = _parse_chord_symbol(f"C{quality_str}")
                     kind = cs.chordKind
                     canonical = _M21_KIND_TO_QUALITY.get(kind)
-                    if canonical:
+                    if canonical and not cs.chordStepModifications:
                         quality = canonical
                 except Exception:
                     pass
