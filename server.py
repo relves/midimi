@@ -5,6 +5,7 @@ import base64
 import html
 import json
 import os
+import random
 import re
 import sqlite3
 import threading
@@ -24,6 +25,7 @@ from sequencer.theory import (
 import sequencer.model as seq_model
 import sequencer.engine as engine
 import sequencer.drill as drill
+import sequencer.drill_cards as drill_cards
 import sequencer.loop as loop
 import sequencer.charts as charts
 from tools import TOOLS, SYSTEM_PROMPT, dispatch_tools
@@ -302,6 +304,21 @@ def init_db():
             FROM scale_drill_old
         """)
         conn.execute("DROP TABLE scale_drill_old")
+    # Harmony drill cards (Slice C). Separate table from scale_drill: its PK is
+    # (key, direction) where `key` is a rotation key, and /drill/status + the
+    # circle-of-fifths grid both assume that. Card rows key on (kind, item).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS card_drill (
+            kind        TEXT NOT NULL,
+            item        TEXT NOT NULL,
+            box         INTEGER DEFAULT 1,
+            due_at      INTEGER,
+            streak      INTEGER DEFAULT 0,
+            last_result TEXT,
+            last_seen   INTEGER,
+            PRIMARY KEY (kind, item)
+        )
+    """)
     # Seed the starter keys (idempotent), due now so they appear on first open.
     now = int(time.time())
     for key in drill.STARTER_KEYS:
@@ -310,6 +327,18 @@ def init_db():
             "VALUES (?, 'spell', 1, ?, 0)",
             (key, now),
         )
+    # Seed whatever card kinds are unlocked (on a fresh DB: just the first).
+    card_rows = [
+        {"kind": k, "item": i, "box": b}
+        for k, i, b in conn.execute("SELECT kind, item, box FROM card_drill").fetchall()
+    ]
+    for kind in drill_cards.kind_unlocks(card_rows):
+        for item in drill_cards.seed_items(kind):
+            conn.execute(
+                "INSERT OR IGNORE INTO card_drill (kind, item, box, due_at, streak) "
+                "VALUES (?, ?, 1, ?, 0)",
+                (kind, item, now),
+            )
     conn.commit()
     conn.close()
 
@@ -787,6 +816,46 @@ def _drill_streak_days() -> int:
     return int(db_get_setting("drill_streak_days") or 0)
 
 
+def _card_rows() -> list[dict]:
+    """card_drill rows, each carrying the synthetic `key` drill.pick_next tie-breaks on."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT kind, item, box, due_at, streak, last_result, last_seen FROM card_drill"
+    ).fetchall()
+    conn.close()
+    cols = ("kind", "item", "box", "due_at", "streak", "last_result", "last_seen")
+    out = [dict(zip(cols, r)) for r in rows]
+    for r in out:
+        r["key"] = drill_cards.card_key(r["kind"], r["item"])
+    return out
+
+
+def _total_due(now: int) -> int:
+    """Everything due across both queues — what the badge and "N due today" mean."""
+    return _drill_due_count(_drill_rows(), now) + _drill_due_count(_card_rows(), now)
+
+
+def _maybe_advance_streak(now: int, streak_days: int) -> int:
+    """Advance the daily streak the first time *both* queues are empty today.
+
+    Shared by the scale drill and the card drill: a day counts as done only when
+    nothing is left in either, otherwise finishing one queue would bank the day
+    while harmony cards sat untouched.
+    """
+    if drill.pick_next(_drill_rows(), now) is not None:
+        return streak_days
+    if drill.pick_next(_card_rows(), now) is not None:
+        return streak_days
+    today = _drill_today()
+    if db_get_setting("drill_last_completed_date") == today:
+        return streak_days
+    last = db_get_setting("drill_last_completed_date")
+    streak_days = streak_days + 1 if last == _drill_yesterday() else 1
+    db_set_setting("drill_streak_days", str(streak_days))
+    db_set_setting("drill_last_completed_date", today)
+    return streak_days
+
+
 class DrillGradeRequest(BaseModel):
     key: str
     answer: list[str] = []
@@ -865,14 +934,8 @@ def _drill_apply_grade(key: str, direction: str, correct: bool, now: int) -> tup
             conn.commit()
             conn.close()
             rows = _drill_rows()
-        # First completion that empties the queue today advances the daily streak.
-        if drill.pick_next(rows, now) is None:
-            today = _drill_today()
-            if db_get_setting("drill_last_completed_date") != today:
-                last = db_get_setting("drill_last_completed_date")
-                streak_days = streak_days + 1 if last == _drill_yesterday() else 1
-                db_set_setting("drill_streak_days", str(streak_days))
-                db_set_setting("drill_last_completed_date", today)
+        # First completion that empties both queues today advances the daily streak.
+        streak_days = _maybe_advance_streak(now, streak_days)
 
     return new_box, streak_days, rows
 
@@ -903,7 +966,7 @@ def drill_next():
         "due": True,
         "key": nxt["key"],
         "direction": direction,
-        "due_today": _drill_due_count(rows, now),
+        "due_today": _total_due(now),
         "streak_days": streak,
     }
     if direction == "ear":
@@ -937,7 +1000,7 @@ def drill_grade(req: DrillGradeRequest):
             "chosen": chosen,
             "expected": expected,
             "box": new_box,
-            "due_today_remaining": _drill_due_count(rows, now),
+            "due_today_remaining": _total_due(now),
             "streak_days": streak_days,
         }
 
@@ -973,7 +1036,7 @@ def drill_grade(req: DrillGradeRequest):
         "normalized_answer": normalized,
         "per_note": per_note,
         "box": new_box,
-        "due_today_remaining": _drill_due_count(rows, now),
+        "due_today_remaining": _total_due(now),
         "streak_days": streak_days,
     }
 
@@ -1005,7 +1068,7 @@ def drill_grade_played(req: DrillKeyRequest):
         "direction": "spell",
         "key": req.key,
         "box": new_box,
-        "due_today_remaining": _drill_due_count(rows, now),
+        "due_today_remaining": _total_due(now),
         "streak_days": streak_days,
     }
 
@@ -1048,12 +1111,299 @@ def drill_status():
             ),
         )
     ]
-    due_today = _drill_due_count(rows, now)
+    due_today = _total_due(now)
     return {
         "keys": keys,
         "due_today": due_today,
         "streak_days": _drill_streak_days(),
         "done_today": due_today == 0,
+    }
+
+
+# ── Harmony drill cards (Slice C) ─────────────────────────────────────────────
+#
+# Prompts randomize their root/key per rep (a box-5 "M3" means major thirds from
+# *any* root), so the prompt that was issued has to survive until grading. It
+# lives here, server-side, rather than round-tripping through the client: the
+# client must not see `expected`/`answer` before it answers, and this is a
+# single-user local app so one active prompt is the whole story.
+
+_card_prompt: dict | None = None
+_card_segments: list[list[dict]] = []  # guide-tone captures, one per chord
+_card_lock = threading.Lock()
+
+# Keys that give the answer away; stripped before the prompt reaches the client.
+# `play_notes` counts: the server sounds ear cards itself, so shipping the notes
+# would hand the client the interval it's being asked to name. Same for `bass`,
+# which names the very inversion note the prompt is testing.
+_CARD_SECRET_KEYS = {
+    "expected", "answer", "answer_note", "expected_chords",
+    "expected_functions", "resolves_to", "chords", "play_notes", "bass",
+}
+
+
+def _card_public(prompt: dict) -> dict:
+    """The client's view of a prompt: everything it needs to render, no answers."""
+    out = {k: v for k, v in prompt.items() if k not in _CARD_SECRET_KEYS}
+    # The client needs to know there's audio to trigger, not what the audio is.
+    out["has_audio"] = bool(prompt.get("play_notes"))
+    if prompt["kind"] == "diatonic" and prompt["item"] == "all":
+        out["expected_count"] = len(prompt["expected_chords"])
+    if prompt["kind"] == "function":
+        # Whether to ask for a resolution is part of the question, not the answer.
+        out["ask_resolution"] = prompt.get("resolves_to") is not None
+    if prompt["kind"] == "guide_tones":
+        # The chord symbols *are* the prompt; their guide tones are the answer.
+        out["symbols"] = [c["symbol"] for c in prompt["chords"]]
+    return out
+
+
+def _typed_notes_as_events(names: list[str]) -> list[dict]:
+    """Typed note names as synthetic note-on events.
+
+    Lets typed answers go through the exact same pitch-class-tolerant grader as
+    played ones (drill.grade_played_notes), so both modes agree on what counts
+    as correct and the UI has one result shape to render.
+    """
+    events = []
+    for raw in names:
+        try:
+            events.append({"note": 60 + NOTE_NAMES[normalize_note_name(raw)], "on": True})
+        except (ValueError, KeyError):
+            events.append({"note": -1, "on": True})  # unparseable: always wrong
+    return events
+
+
+def _card_row(kind: str, item: str) -> dict | None:
+    return next((r for r in _card_rows() if r["kind"] == kind and r["item"] == item), None)
+
+
+def _card_apply_grade(kind: str, item: str, correct: bool, now: int) -> tuple[int, int]:
+    """Persist a graded card result plus unlock/streak bookkeeping.
+
+    Returns (new_box, streak_days). Mirrors _drill_apply_grade for scale rows.
+    """
+    row = _card_row(kind, item)
+    if row is None:
+        raise HTTPException(404, f"Card not active: {kind}/{item}")
+
+    new_box, new_due = drill.schedule_after(row["box"], correct, now)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE card_drill SET box=?, due_at=?, streak=?, last_result=?, last_seen=? "
+        "WHERE kind=? AND item=?",
+        (new_box, new_due, row["streak"] + 1 if correct else 0,
+         "correct" if correct else "incorrect", now, kind, item),
+    )
+    conn.commit()
+    conn.close()
+
+    streak_days = _drill_streak_days()
+    if correct:
+        # Seed the next week's deck once this one is internalized.
+        new_kinds = drill_cards.kind_unlocks(_card_rows())
+        if new_kinds:
+            conn = sqlite3.connect(DB_PATH)
+            for k in new_kinds:
+                for i in drill_cards.seed_items(k):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO card_drill (kind, item, box, due_at, streak) "
+                        "VALUES (?, ?, 1, ?, 0)",
+                        (k, i, now),
+                    )
+            conn.commit()
+            conn.close()
+        streak_days = _maybe_advance_streak(now, streak_days)
+    return new_box, streak_days
+
+
+class CardGradeRequest(BaseModel):
+    """Answer payload for /drill/cards/grade — which fields matter depends on kind.
+
+    `played` grades the captured MIDI instead of a typed answer (spell kinds).
+    """
+    choice: str | None = None       # ear kinds: the picked quality/interval
+    note: str | None = None         # interval_spell, typed: the upper note
+    notes: list[str] = []           # triad/seventh/diatonic spell, typed
+    symbols: list[str] = []         # diatonic "all": the seven chord symbols
+    functions: list[str] = []       # function: T/PD/D per chord
+    resolution: str | None = None   # function: predicted resolution numeral
+    played: bool = False
+    graded: bool = True             # False = free practice; never touches the schedule
+
+
+@app.get("/drill/cards/next")
+def drill_cards_next():
+    """Pick the most-overdue card, build its prompt, and stash it for grading."""
+    global _card_prompt, _card_segments
+    now = int(time.time())
+    rows = _card_rows()
+    nxt = drill.pick_next(rows, now)
+    if nxt is None:
+        return {"due": False, "streak_days": _drill_streak_days(), "due_today": 0}
+
+    kind, item = nxt["kind"], nxt["item"]
+    # Wk2 inversion variant, offered only once the root-position row is established.
+    inversion = None
+    if kind == "triad_spell" and nxt["box"] >= drill.UNLOCK_BOX:
+        inversion = random.choice([None, 1, 2])
+
+    with _card_lock:
+        _card_prompt = drill_cards.make_prompt(kind, item, inversion=inversion)
+        _card_segments = []
+        prompt = _card_public(_card_prompt)
+
+    return {
+        "due": True,
+        "prompt": prompt,
+        "box": nxt["box"],
+        "due_today": _total_due(now),
+        "streak_days": _drill_streak_days(),
+    }
+
+
+@app.post("/drill/cards/play_prompt")
+def drill_cards_play_prompt():
+    """Sound the current ear card's notes (same confirm-audio path as the scale drill)."""
+    with _card_lock:
+        prompt = _card_prompt
+    if prompt is None:
+        raise HTTPException(400, "No active card. Fetch /drill/cards/next first.")
+    notes = prompt.get("play_notes")
+    if not notes:
+        raise HTTPException(400, f"Card kind {prompt['kind']!r} has nothing to play.")
+    midis = [60 + NOTE_NAMES[n] for n in notes]
+
+    def _run():
+        # Arpeggiate, then sound it together — you need both to name a quality.
+        prev = -1
+        voiced = []
+        for m in midis:
+            while m <= prev:
+                m += 12
+            voiced.append(m)
+            prev = m
+        for m in voiced:
+            _play([m], 380)
+        _play(voiced, 1100)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True}
+
+
+@app.post("/drill/cards/record/start")
+def drill_cards_record_start():
+    if engine.current_input_port() is None:
+        raise HTTPException(400, "No MIDI input port selected. Open Settings to choose one.")
+    engine.arm_recording()
+    return {"ok": True, "recording": True}
+
+
+@app.post("/drill/cards/segment")
+def drill_cards_segment():
+    """Close the current guide-tone chord capture and arm the next.
+
+    Guide-tone grading needs one event segment per chord of the ii-V-I. We
+    segment on an explicit UI advance rather than on loop-clock bar boundaries:
+    the card is a spelling exercise, not a time exercise, and tying it to the
+    transport would make a slow, correct answer read as wrong.
+    """
+    global _card_segments
+    with _card_lock:
+        prompt = _card_prompt
+    if prompt is None or prompt["kind"] != "guide_tones":
+        raise HTTPException(400, "No active guide-tone card.")
+    events = engine.stop_recording()
+    with _card_lock:
+        _card_segments.append(events)
+        captured = len(_card_segments)
+    total = len(prompt["chords"])
+    if captured < total:
+        engine.arm_recording()
+    return {"ok": True, "captured": captured, "total": total, "complete": captured >= total}
+
+
+@app.post("/drill/cards/grade")
+def drill_cards_grade(req: CardGradeRequest):
+    global _card_prompt
+    now = int(time.time())
+    with _card_lock:
+        prompt = _card_prompt
+        segments = list(_card_segments)
+    if prompt is None:
+        raise HTTPException(400, "No active card. Fetch /drill/cards/next first.")
+
+    kind, item = prompt["kind"], prompt["item"]
+
+    if kind in ("interval_ear", "seventh_ear"):
+        graded = drill_cards.grade_named(prompt, req.choice or "")
+    elif kind == "guide_tones":
+        graded = drill_cards.grade_guide_tones(prompt, segments)
+    elif kind == "function":
+        graded = drill_cards.grade_function(prompt, req.functions, req.resolution)
+    elif kind == "diatonic" and item == "all":
+        graded = drill_cards.grade_diatonic_list(prompt, req.symbols)
+    elif kind == "interval_spell" and not req.played:
+        graded = drill_cards.grade_typed_note(req.note or "", prompt["answer_note"])
+    elif req.played:
+        graded = drill_cards.grade_prompt_played(prompt, engine.stop_recording())
+    else:
+        graded = drill_cards.grade_prompt_played(prompt, _typed_notes_as_events(req.notes))
+
+    if req.graded:
+        box, streak_days = _card_apply_grade(kind, item, graded["correct"], now)
+    else:
+        row = _card_row(kind, item)
+        box, streak_days = (row["box"] if row else 0), _drill_streak_days()
+
+    with _card_lock:
+        _card_prompt = None
+
+    return {
+        **graded,
+        "kind": kind,
+        "item": item,
+        # The answer is safe to reveal now that it's been graded.
+        "prompt": prompt,
+        "box": box,
+        "due_today_remaining": _total_due(now),
+        "streak_days": streak_days,
+    }
+
+
+@app.get("/drill/cards/status")
+def drill_cards_status():
+    """Per-kind mastery rows for the UI grid, in week order."""
+    now = int(time.time())
+    rows = _card_rows()
+    by_kind = {k: [] for k in drill_cards.KIND_ORDER}
+    for r in rows:
+        by_kind.setdefault(r["kind"], []).append(r)
+
+    kinds = []
+    for kind in drill_cards.KIND_ORDER:
+        deck = drill_cards.DECKS[kind]
+        present = {r["item"]: r for r in by_kind.get(kind, [])}
+        items = [
+            {
+                "item": item,
+                "box": present[item]["box"] if item in present else 0,
+                "due": (item in present and present[item]["due_at"] is not None
+                        and present[item]["due_at"] <= now),
+                "last_result": present[item]["last_result"] if item in present else None,
+            }
+            for item in deck
+        ]
+        kinds.append({
+            "kind": kind,
+            "unlocked": bool(present),
+            "items": items,
+            "due": sum(1 for i in items if i["due"]),
+        })
+    return {
+        "kinds": kinds,
+        "due_today": _drill_due_count(rows, now),
+        "streak_days": _drill_streak_days(),
     }
 
 

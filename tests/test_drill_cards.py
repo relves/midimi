@@ -288,3 +288,247 @@ def test_grade_played_wrapper_unchanged():
     events = _events(["C", "D", "E", "F", "G", "A", "B"])
     res = drill.grade_played(events, "C")
     assert res["correct"] and res["expected"][0] == "C"
+
+
+# ── Endpoints (TestClient against a temp DB) ─────────────────────────────────
+
+@pytest.fixture
+def client(monkeypatch):
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    os.unlink(path)  # let init_db create it fresh
+    monkeypatch.setenv("MIDIMI_DB", path)
+    # Import after env is set so module-level init_db() uses the temp DB.
+    sys.modules.pop("server", None)
+    import server  # noqa: F401
+    from fastapi.testclient import TestClient
+    with TestClient(server.app) as c:
+        yield c
+    if os.path.exists(path):
+        os.unlink(path)
+
+
+def _seed(kind, item, due_at=1):
+    """Force a card row to exist and be the most-overdue one."""
+    import sqlite3
+    import server
+
+    conn = sqlite3.connect(server.DB_PATH)
+    conn.execute(
+        "INSERT OR REPLACE INTO card_drill (kind, item, box, due_at, streak) "
+        "VALUES (?, ?, 1, ?, 0)", (kind, item, due_at))
+    conn.commit()
+    conn.close()
+
+
+def test_fresh_db_seeds_only_the_first_kind(client):
+    s = client.get("/drill/cards/status").json()
+    by_kind = {k["kind"]: k for k in s["kinds"]}
+    assert by_kind["interval_spell"]["unlocked"] is True
+    assert by_kind["interval_ear"]["unlocked"] is False
+    assert s["due_today"] == len(dc.INTERVALS)
+
+
+def test_next_hides_the_answer(client):
+    p = client.get("/drill/cards/next").json()["prompt"]
+    assert p["kind"] == "interval_spell"
+    # `root` and `text` are the question; `expected`/`answer_note` must not leak.
+    assert "root" in p and "text" in p
+    assert "expected" not in p and "answer_note" not in p
+
+
+def test_typed_interval_grades_and_promotes(client):
+    p = client.get("/drill/cards/next").json()["prompt"]
+    answer = dc._chord_names(p["root"], p["item"])[1]
+    r = client.post("/drill/cards/grade", json={"note": answer}).json()
+    assert r["correct"] is True
+    assert r["box"] == 2
+    assert r["prompt"]["answer_note"] == answer  # revealed only after grading
+
+
+def test_typed_spell_answer_is_pitch_class_tolerant(client):
+    _seed("triad_spell", "major")
+    p = client.get("/drill/cards/next").json()["prompt"]
+    assert p["kind"] == "triad_spell"
+    # Respell every note the sharp way. Different letters, same pitch classes —
+    # a keyboard can't express enharmonic intent, so this must still grade correct.
+    sharp = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    names = [sharp[NOTE_NAMES[n] % 12] for n in dc._chord_names(p["root"], "major")]
+    r = client.post("/drill/cards/grade", json={"notes": names}).json()
+    assert r["correct"] is True
+    assert r["missing_notes"] == [] and r["wrong_notes"] == []
+
+
+def test_typed_spell_wrong_note_reported(client):
+    _seed("triad_spell", "major")
+    client.get("/drill/cards/next")
+    r = client.post("/drill/cards/grade", json={"notes": ["C", "C", "C"]}).json()
+    assert r["correct"] is False
+    assert r["box"] == 1
+
+
+def test_practice_mode_does_not_touch_the_schedule(client):
+    p = client.get("/drill/cards/next").json()["prompt"]
+    answer = dc._chord_names(p["root"], p["item"])[1]
+    r = client.post("/drill/cards/grade",
+                    json={"note": answer, "graded": False}).json()
+    assert r["correct"] is True
+    assert r["box"] == 1  # unchanged
+
+
+def test_ear_card_choices_and_play_prompt(client, monkeypatch):
+    import server
+
+    _seed("interval_ear", "M3")
+    nxt = client.get("/drill/cards/next").json()
+    p = nxt["prompt"]
+    assert p["kind"] == "interval_ear"
+    assert "M3" in p["choices"] and "answer" not in p
+    # The server sounds the card; shipping play_notes would hand over the answer.
+    assert "play_notes" not in p and p["has_audio"] is True
+
+    calls = []
+    monkeypatch.setattr(server, "_play", lambda notes, dur: calls.append(notes))
+    assert client.post("/drill/cards/play_prompt").json()["ok"] is True
+    import time as _t
+    _t.sleep(0.3)
+    assert calls  # arpeggio then the chord together
+
+    r = client.post("/drill/cards/grade", json={"choice": "M3"}).json()
+    assert r["correct"] is True and r["box"] == 2
+
+
+def test_diatonic_list_card(client):
+    _seed("diatonic", "all")
+    p = client.get("/drill/cards/next").json()["prompt"]
+    assert p["expected_count"] == 7
+    assert "expected_chords" not in p
+    symbols = [c["symbol"] for c in dc.diatonic_sevenths(p["key"])]
+    r = client.post("/drill/cards/grade", json={"symbols": symbols}).json()
+    assert r["correct"] is True
+
+
+def test_function_card_asks_for_resolution(client):
+    _seed("function", "I-IV-V")
+    p = client.get("/drill/cards/next").json()["prompt"]
+    assert p["ask_resolution"] is True
+    assert "expected_functions" not in p and "resolves_to" not in p
+    r = client.post("/drill/cards/grade", json={
+        "functions": ["T", "PD", "D"], "resolution": "I"}).json()
+    assert r["correct"] is True
+
+    # Right labels, wrong resolution -> not correct.
+    _seed("function", "I-IV-V")
+    client.get("/drill/cards/next")
+    r = client.post("/drill/cards/grade", json={
+        "functions": ["T", "PD", "D"], "resolution": "IV"}).json()
+    assert r["labels_correct"] is True and r["correct"] is False
+
+
+def test_guide_tones_segmented_capture(client, monkeypatch):
+    import server
+
+    _seed("guide_tones", "C")
+    p = client.get("/drill/cards/next").json()["prompt"]
+    assert p["kind"] == "guide_tones"
+    assert p["symbols"] == ["Dm7", "G7", "Cmaj7"]
+    assert "chords" not in p  # guide tones themselves stay server-side
+
+    chords = dc.guide_tones("C")
+    monkeypatch.setattr(server.engine, "arm_recording", lambda: None)
+    for chord in chords:
+        events = [{"note": 60 + NOTE_NAMES[n], "on": True} for n in chord["guide_tones"]]
+        monkeypatch.setattr(server.engine, "stop_recording", lambda e=events: e)
+        seg = client.post("/drill/cards/segment").json()
+        assert seg["total"] == 3
+    assert seg["complete"] is True
+
+    r = client.post("/drill/cards/grade", json={}).json()
+    assert r["correct"] is True
+    assert [c["symbol"] for c in r["chords"]] == ["Dm7", "G7", "Cmaj7"]
+
+
+def test_guide_tones_rejects_the_root(client, monkeypatch):
+    import server
+
+    _seed("guide_tones", "C")
+    client.get("/drill/cards/next")
+    monkeypatch.setattr(server.engine, "arm_recording", lambda: None)
+    for chord in dc.guide_tones("C"):
+        # Play the root too — that's exactly what "rootless" forbids.
+        names = chord["guide_tones"] + [chord["avoid_root"]]
+        events = [{"note": 60 + NOTE_NAMES[n], "on": True} for n in names]
+        monkeypatch.setattr(server.engine, "stop_recording", lambda e=events: e)
+        client.post("/drill/cards/segment")
+    r = client.post("/drill/cards/grade", json={}).json()
+    assert r["correct"] is False
+
+
+def test_clearing_a_deck_unlocks_the_next_kind(client):
+    import sqlite3
+    import server
+
+    # Put every interval_spell row one grade below UNLOCK_BOX, all due.
+    conn = sqlite3.connect(server.DB_PATH)
+    conn.execute("UPDATE card_drill SET box=?, due_at=1 WHERE kind='interval_spell'",
+                 (drill.UNLOCK_BOX - 1,))
+    conn.commit()
+    conn.close()
+
+    for _ in range(len(dc.INTERVALS)):
+        nxt = client.get("/drill/cards/next").json()
+        if not nxt["due"] or nxt["prompt"]["kind"] != "interval_spell":
+            break
+        p = nxt["prompt"]
+        client.post("/drill/cards/grade",
+                    json={"note": dc._chord_names(p["root"], p["item"])[1]})
+
+    by_kind = {k["kind"]: k for k in client.get("/drill/cards/status").json()["kinds"]}
+    assert by_kind["interval_ear"]["unlocked"] is True
+    assert by_kind["triad_spell"]["unlocked"] is False  # chain advances one step
+
+
+def test_grade_without_an_active_card_is_a_400(client):
+    assert client.post("/drill/cards/grade", json={"note": "C"}).status_code == 400
+
+
+def test_double_accidental_intervals_are_lookupable():
+    """chord_note_names spells by letter distance, so double flats occur naturally.
+
+    m2 above Db is Ebb; if NOTE_NAMES can't resolve that, every grader that maps
+    expected names to pitch classes raises KeyError instead of grading.
+    """
+    assert dc._chord_names("Db", "m2") == ["Db", "Ebb"]
+    assert NOTE_NAMES["Ebb"] == NOTE_NAMES["D"]
+    assert NOTE_NAMES["Bbb"] == NOTE_NAMES["A"]
+
+    # And the graders actually work on them, both typed and played.
+    assert dc.grade_typed_note("D", "Ebb")["correct"] is True
+    prompt = {"kind": "interval_spell", "item": "m2", "expected": ["Db", "Ebb"]}
+    assert dc.grade_prompt_played(prompt, _events(["Db", "D"]))["correct"] is True
+
+
+def test_triad_inversion_does_not_leak_the_bass_note(client):
+    """"C major, 1st inversion" is the question; naming the bass would answer it."""
+    import sqlite3
+    import server
+
+    conn = sqlite3.connect(server.DB_PATH)
+    conn.execute("INSERT OR REPLACE INTO card_drill (kind, item, box, due_at, streak) "
+                 "VALUES ('triad_spell', 'major', 4, 1, 0)")
+    conn.commit()
+    conn.close()
+
+    for _ in range(30):
+        p = client.get("/drill/cards/next").json()["prompt"]
+        assert "bass" not in p and "expected" not in p
+        if "inversion" in p:
+            assert "inversion" in p["text"] or "inversion" in p["text"].lower()
+            break
+        client.post("/drill/cards/grade", json={"notes": [], "graded": False})
+        conn = sqlite3.connect(server.DB_PATH)
+        conn.execute("UPDATE card_drill SET due_at=1 WHERE kind='triad_spell'")
+        conn.commit()
+        conn.close()

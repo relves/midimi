@@ -86,6 +86,14 @@ NOTE_NAMES: dict[str, int] = {
     "G#": 8, "Ab": 8, "A": 9, "A#": 10, "Bb": 10, "B": 11, "Cb": 11,
 }
 
+# Double accidentals. `chord_note_names` spells intervals by letter distance, so
+# it legitimately produces these (a minor 2nd above Db is Ebb, not D) — without
+# them any lookup of such a name raises KeyError instead of returning a pitch class.
+for _letter, _pc in _LETTER_PC.items():
+    NOTE_NAMES.setdefault(_letter + "##", (_pc + 2) % 12)
+    NOTE_NAMES.setdefault(_letter + "bb", (_pc - 2) % 12)
+del _letter, _pc
+
 # Interval dyad qualities map to music21 interval specs.
 # These aren't chord symbols so we handle them separately.
 _DYAD_INTERVALS: dict[str, str] = {

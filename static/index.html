@@ -304,6 +304,42 @@
     .drill-recording { color: #f0a0a0; font-weight: 700; }
 
     /* Ear-mode choice buttons */
+    /* Harmony card mastery: one row per kind, one pip per deck item. */
+    #card-grid { display: flex; flex-direction: column; gap: 5px; }
+    .card-row {
+      display: grid; grid-template-columns: 92px 1fr auto; align-items: center;
+      gap: 8px; padding: 3px 6px; border-radius: 6px; cursor: pointer;
+    }
+    .card-row:hover { background: var(--surface2); }
+    .card-row.locked { opacity: 0.38; cursor: not-allowed; }
+    .card-row .kind-name {
+      font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--text-dim); text-align: right;
+    }
+    .card-row .pips { display: flex; gap: 3px; flex-wrap: wrap; }
+    .card-pip { width: 10px; height: 10px; border-radius: 2px; background: #262433; }
+    .card-pip.due { box-shadow: 0 0 0 1.5px var(--accent); }
+    .card-row .kind-due {
+      font-size: 0.66rem; color: var(--accent); min-width: 30px; text-align: right;
+    }
+    /* Function card: a T/PD/D picker per chord. */
+    .fn-chords { display: flex; flex-wrap: wrap; gap: 14px; justify-content: center; margin: 18px 0; }
+    .fn-chord { text-align: center; }
+    .fn-chord .sym { font-weight: 700; margin-bottom: 6px; }
+    .fn-chord .opts { display: flex; gap: 3px; }
+    .fn-chord button {
+      background: var(--surface); border: 1px solid var(--border); color: var(--text-dim);
+      border-radius: 5px; padding: 3px 7px; font-size: 0.72rem; cursor: pointer;
+    }
+    .fn-chord button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .gt-steps { display: flex; gap: 8px; justify-content: center; margin: 16px 0; }
+    .gt-step {
+      padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
+      background: var(--surface); font-weight: 700; color: var(--text-dim);
+    }
+    .gt-step.on { border-color: var(--accent); color: var(--text); }
+    .gt-step.done { border-color: #50c878; color: #7fe0a0; }
+
     .drill-choices { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin: 18px 0; }
     .drill-choice {
       min-width: 64px; padding: 14px 18px; font-size: 1.05rem; font-weight: 700; cursor: pointer;
@@ -1074,6 +1110,8 @@
       <div id="drill-grid-wrap">
         <div class="grid-title">Circle of Fifths · mastery</div>
         <div id="drill-grid"></div>
+        <div class="grid-title" style="margin-top:18px">Harmony · mastery</div>
+        <div id="card-grid"></div>
       </div>
       <div id="drill-body" class="drill-card"></div>
     </div>
@@ -1585,6 +1623,10 @@
     const DRILL_PC = {
       C:0,'B#':0,'C#':1,Db:1,D:2,'D#':3,Eb:3,E:4,Fb:4,F:5,'E#':5,
       'F#':6,Gb:6,G:7,'G#':8,Ab:8,A:9,'A#':10,Bb:10,B:11,Cb:11,
+      // Double accidentals: intervals spelled by letter distance produce these
+      // (a minor 2nd above Db is Ebb), and without them playback drops the note.
+      Cbb:10,Dbb:0,Ebb:2,Fbb:3,Gbb:5,Abb:7,Bbb:9,
+      'C##':2,'D##':4,'E##':6,'F##':7,'G##':9,'A##':11,'B##':1,
     };
     function drillNameToMidi(name) {
       const pc = DRILL_PC[name];
@@ -1621,7 +1663,7 @@
         _drillHasInput = !!s.current_input_port;
       } catch (e) { _drillHasInput = false; }
       if (!_drillHasInput) _drillMode = 'type';
-      await loadDrillGrid();
+      await Promise.all([loadDrillGrid(), loadCardGrid()]);
     }
 
     async function openDrill() {
@@ -1954,6 +1996,281 @@
         `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">${nodes}</svg>`;
     }
 
+    // ── Harmony drill cards ──
+    //
+    // The scale drill answers one question ("spell this key"); these answer eight,
+    // so the flow is: GET /drill/cards/next hands back a prompt whose answer stays
+    // server-side, a per-kind renderer draws it, and one POST /drill/cards/grade
+    // sends whichever answer field that kind uses.
+
+    const KIND_LABELS = {
+      interval_spell: 'Intervals', interval_ear: 'Intervals ·ear',
+      triad_spell: 'Triads', seventh_spell: '7th chords', seventh_ear: '7ths ·ear',
+      diatonic: 'Diatonic', function: 'Function', guide_tones: 'Guide tones',
+    };
+    const FUNCTIONS = ['T', 'PD', 'D'];
+
+    let _cardPrompt = null;      // the public (answer-free) prompt being shown
+    let _cardResponse = null;    // last /drill/cards/next payload, for re-render
+let _cardSegments = 0;       // guide tones: chords captured so far
+
+    async function loadCardGrid() {
+      let s;
+      try { s = await (await fetch('/drill/cards/status')).json(); }
+      catch (e) { return; }
+      document.getElementById('card-grid').innerHTML = (s.kinds || []).map(k => {
+        const pips = k.items.map(i => {
+          const fill = i.box ? (BOX_COLORS[i.box] || BOX_COLORS[1]) : '#262433';
+          const title = `${i.item}: ${i.box ? 'box ' + i.box : 'locked'}${i.due ? ' · due now' : ''}`;
+          return `<span class="card-pip ${i.due ? 'due' : ''}" style="background:${fill}" title="${title}"></span>`;
+        }).join('');
+        const click = k.unlocked ? 'onclick="cardNext()"' : '';
+        const title = k.unlocked ? 'Click to drill harmony cards' : 'Locked — master the kind above first';
+        return `<div class="card-row ${k.unlocked ? '' : 'locked'}" ${click} title="${title}">
+            <span class="kind-name">${KIND_LABELS[k.kind] || k.kind}</span>
+            <span class="pips">${pips}</span>
+            <span class="kind-due">${k.due ? k.due + ' due' : ''}</span>
+          </div>`;
+      }).join('');
+    }
+
+    async function cardNext() {
+      _cardSegments = 0;
+      _drillRecording = false;
+      const body = document.getElementById('drill-body');
+      const r = await (await fetch('/drill/cards/next')).json();
+      await loadCardGrid();
+      if (!r.due) {
+        _cardPrompt = null;
+        body.innerHTML = `<div class="drill-done">
+            <div class="big">✅ Harmony cards done</div>
+            <div class="drill-sub">Nothing due. 🔥 ${r.streak_days} day streak.</div>
+            <button class="drill-btn secondary" onclick="drillNext()">Back to scales</button>
+          </div>`;
+        return;
+      }
+      _cardPrompt = r.prompt;
+      _cardResponse = r;
+      renderCard(r);
+    }
+
+    function renderCard(r) {
+      const p = r.prompt;
+      const sub = `${r.due_today} due today · box ${r.box}`;
+      const body = document.getElementById('drill-body');
+      let input;
+
+      if (p.kind === 'interval_ear' || p.kind === 'seventh_ear') {
+        const choices = p.choices.map(c =>
+          `<button class="drill-choice" data-choice="${c}" onclick="submitCardChoice('${c}')">${escapeHtml(p.choice_labels[c])}</button>`).join('');
+        input = `<div><button class="drill-btn secondary" onclick="cardPlayPrompt()">▶ Play it again</button></div>
+          <div class="drill-choices">${choices}</div>`;
+      } else if (p.kind === 'function') {
+        const chords = p.symbols.map((sym, i) => `
+          <div class="fn-chord" data-i="${i}">
+            <div class="sym">${escapeHtml(sym)}</div>
+            <div class="drill-sub" style="margin-bottom:6px">${escapeHtml(p.numerals[i])}</div>
+            <div class="opts">${FUNCTIONS.map(f =>
+              `<button data-fn="${f}" onclick="pickFunction(${i},'${f}')">${f}</button>`).join('')}</div>
+          </div>`).join('');
+        const res = p.ask_resolution
+          ? `<div class="drill-sub">…and what does it resolve to?</div>
+             <input id="card-resolution" placeholder="e.g. I" autocomplete="off" style="max-width:120px" />`
+          : '';
+        input = `<div class="fn-chords">${chords}</div>${res}
+          <div><button class="drill-btn" onclick="submitCard()">Submit</button></div>`;
+      } else if (p.kind === 'guide_tones') {
+        input = guideToneInput(p);
+      } else if (p.kind === 'diatonic' && p.item === 'all') {
+        input = `<input id="drill-answer" placeholder="e.g. Cmaj7 Dm7 Em7 Fmaj7 G7 Am7 Bm7b5" autocomplete="off" />
+          <div class="drill-hint">All ${p.expected_count}, any order.</div>
+          <div><button class="drill-btn" onclick="submitCard()">Submit</button></div>`;
+      } else {
+        // Spelling kinds: type the notes, or play them if a keyboard is connected.
+        input = _drillMode === 'play'
+          ? `<div class="drill-hint">Play the notes. Octaves are fine — we grade the pitches.</div>
+             <div><button class="drill-btn" id="drill-rec-btn" onclick="toggleCardRecord()">● Start playing</button></div>`
+          : `<input id="drill-answer" placeholder="${p.kind === 'interval_spell' ? 'the upper note, e.g. G' : 'e.g. C E G'}" autocomplete="off" />
+             <div><button class="drill-btn" onclick="submitCard()">Submit</button></div>`;
+      }
+
+      const modeToggle = CARD_PLAYABLE.has(p.kind) ? drillModeToggle() : '';
+      body.innerHTML = `
+        ${modeToggle}
+        <div class="drill-prompt">${p.kind.endsWith('_ear') ? '🔊 ' : ''}${escapeHtml(p.text)}</div>
+        <div class="drill-sub">${sub}</div>
+        <div id="drill-input-area">${input}</div>
+        <div class="drill-result" id="drill-result"></div>`;
+
+      const answer = document.getElementById('drill-answer');
+      if (answer) {
+        answer.focus();
+        answer.addEventListener('keydown', e => { if (e.key === 'Enter') submitCard(); });
+      }
+      if (p.has_audio) cardPlayPrompt();
+    }
+
+    // Kinds whose answer can be played on the keyboard rather than typed.
+    const CARD_PLAYABLE = new Set(['interval_spell', 'triad_spell', 'seventh_spell', 'diatonic']);
+
+    function guideToneInput(p) {
+      const steps = p.symbols.map((sym, i) => {
+        const cls = i < _cardSegments ? 'done' : (i === _cardSegments ? 'on' : '');
+        return `<div class="gt-step ${cls}">${escapeHtml(sym)}</div>`;
+      }).join('');
+      const done = _cardSegments >= p.symbols.length;
+      const btn = done
+        ? `<button class="drill-btn" onclick="submitCard()">Grade</button>`
+        : (_drillRecording
+            ? `<button class="drill-btn drill-recording" onclick="cardSegment()">■ Next chord</button>`
+            : `<button class="drill-btn" onclick="toggleCardRecord()">● Start playing</button>`);
+      return `<div class="drill-hint">3rd and 7th only — leave the root out. Advance one chord at a time.</div>
+        <div class="gt-steps">${steps}</div>
+        <div>${btn}</div>`;
+    }
+
+    function cardPlayPrompt() {
+      fetch('/drill/cards/play_prompt', { method: 'POST' }).catch(() => {});
+    }
+
+    function pickFunction(i, fn) {
+      const chord = document.querySelector(`.fn-chord[data-i="${i}"]`);
+      chord.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.fn === fn));
+    }
+
+    async function toggleCardRecord() {
+      const res = await fetch('/drill/cards/record/start', { method: 'POST' });
+      if (!res.ok) {
+        document.getElementById('drill-result').innerHTML =
+          '<div class="drill-hint">No MIDI input — open Settings to select one.</div>';
+        return;
+      }
+      _drillRecording = true;
+      if (_cardPrompt.kind === 'guide_tones') {
+        document.getElementById('drill-input-area').innerHTML = guideToneInput(_cardPrompt);
+        return;
+      }
+      const btn = document.getElementById('drill-rec-btn');
+      btn.textContent = '■ Stop & grade';
+      btn.classList.add('drill-recording');
+      btn.setAttribute('onclick', 'submitCard(true)');
+    }
+
+    // Guide tones only: close this chord's capture, arm the next.
+    async function cardSegment() {
+      const r = await (await fetch('/drill/cards/segment', { method: 'POST' })).json();
+      _cardSegments = r.captured;
+      _drillRecording = !r.complete;
+      document.getElementById('drill-input-area').innerHTML = guideToneInput(_cardPrompt);
+    }
+
+    async function submitCardChoice(choice) {
+      await postCardGrade({ choice });
+    }
+
+    async function submitCard(played) {
+      const p = _cardPrompt;
+      const payload = { played: !!played };
+      if (p.kind === 'function') {
+        payload.functions = Array.from(document.querySelectorAll('.fn-chord')).map(c => {
+          const on = c.querySelector('button.on');
+          return on ? on.dataset.fn : '';
+        });
+        const res = document.getElementById('card-resolution');
+        if (res) payload.resolution = res.value.trim();
+      } else if (!played && p.kind !== 'guide_tones') {
+        const input = document.getElementById('drill-answer');
+        const parts = (input ? input.value : '').trim().split(/[\s,]+/).filter(Boolean);
+        if (!parts.length) return;
+        if (p.kind === 'diatonic' && p.item === 'all') payload.symbols = parts;
+        else if (p.kind === 'interval_spell') payload.note = parts[0];
+        else payload.notes = parts;
+      }
+      await postCardGrade(payload);
+    }
+
+    async function postCardGrade(payload) {
+      const p = _cardPrompt;
+      const r = await (await fetch('/drill/cards/grade', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...payload, graded: !_drillPractice }),
+      })).json();
+      _drillRecording = false;
+      renderCardResult(p, r);
+    }
+
+    function renderCardResult(p, r) {
+      const verdict = r.correct
+        ? '<div class="drill-verdict correct">✓ Correct</div>'
+        : '<div class="drill-verdict incorrect">✗ Not quite</div>';
+
+      // The grade response carries the full prompt, so the answer can be shown now.
+      const full = r.prompt || {};
+      let detail = '';
+      if (p.kind === 'interval_ear' || p.kind === 'seventh_ear') {
+        document.querySelectorAll('.drill-choice').forEach(b => {
+          if (b.dataset.choice === r.expected) b.classList.add('right');
+          else if (b.dataset.choice === r.answer) b.classList.add('wrong');
+          b.disabled = true;
+        });
+        detail = `<div class="drill-sub">${escapeHtml(p.choice_labels[r.expected])} from ${escapeHtml(full.root)}: ${(full.play_notes || []).join(' ')}</div>`;
+      } else if (p.kind === 'interval_spell' && r.answer !== undefined && !r.played_names) {
+        const spell = r.correct && r.spelled_correctly === false
+          ? `<div class="drill-sub">Right note — spelled ${escapeHtml(r.expected)} here.</div>` : '';
+        detail = `<div class="drill-sub">Answer: ${escapeHtml(r.expected)}</div>${spell}`;
+      } else if (p.kind === 'diatonic' && p.item === 'all') {
+        detail = `<div class="drill-notes">${r.expected.map(s =>
+            `<span class="drill-note ${r.missing.includes(s) ? 'bad' : 'ok'}">${escapeHtml(s)}</span>`).join('')}</div>`
+          + (r.wrong.length ? `<div class="drill-sub">Not in the key: ${r.wrong.map(escapeHtml).join(' ')}</div>` : '');
+      } else if (p.kind === 'function') {
+        detail = `<div class="drill-sub">Functions: ${r.expected_functions.join(' · ')}</div>`
+          + (r.expected_resolution ? `<div class="drill-sub">Resolves to ${escapeHtml(r.expected_resolution)}${r.resolution_correct ? '' : ' — missed'}</div>` : '');
+      } else if (p.kind === 'guide_tones') {
+        detail = (r.chords || []).map(c =>
+          `<div class="drill-sub"><strong>${escapeHtml(c.symbol)}</strong>: ${(c.expected || []).join(' ')}${c.correct ? ' ✓' : ' ✗'}</div>`).join('')
+          || `<div class="drill-sub">${escapeHtml(r.error || '')}</div>`;
+      } else {
+        // Played/typed note answer — same shape the scale drill renders.
+        const notes = (r.played_names || []).map(n =>
+          `<span class="drill-note ${r.wrong_notes.includes(n) ? 'bad' : 'ok'}">${escapeHtml(n)}</span>`).join('')
+          || '<span class="drill-note bad">— nothing played —</span>';
+        detail = `<div class="drill-notes">${notes}</div>`
+          + (r.missing_notes.length ? `<div class="drill-sub">Missing: ${r.missing_notes.join(' ')}</div>` : '')
+          + `<div class="drill-sub">Answer: ${(r.expected || []).join(' ')}</div>`
+          + (r.bass_ok === false ? `<div class="drill-sub">Bass should be ${escapeHtml(r.expected_bass)}.</div>` : '');
+      }
+
+      document.getElementById('drill-result').innerHTML = `
+        ${verdict}
+        ${detail}
+        <div>
+          <button class="drill-btn secondary" onclick="cardHear()">▶ Hear it</button>
+          <button class="drill-btn" onclick="cardNext()">Next</button>
+        </div>`;
+
+      // Stash the notes to sound on "Hear it": for ear cards that's what was played.
+      const heard = full.expected || full.play_notes
+        || (full.chords || []).flatMap(c => c.guide_tones) || [];
+      document.getElementById('drill-body').dataset.cardNotes = heard.join(',');
+      loadDrillBadge();
+      loadCardGrid();
+      if (r.correct) cardHear();
+    }
+
+    function cardHear() {
+      const names = (document.getElementById('drill-body').dataset.cardNotes || '')
+        .split(',').filter(Boolean);
+      let prev = -1, step = 0;
+      names.forEach(name => {
+        let midi = drillNameToMidi(name);
+        if (midi === null) return;
+        while (midi <= prev) midi += 12;
+        prev = midi;
+        const m = midi;
+        setTimeout(() => playMidiNote(m), step++ * 340);
+      });
+    }
+
     function drillModeToggle() {
       const disabled = _drillHasInput ? '' : 'disabled';
       const hint = _drillHasInput ? '' :
@@ -1967,19 +2284,29 @@
     function setDrillMode(mode) {
       if (mode === 'play' && !_drillHasInput) return;
       _drillMode = mode;
+      // Re-render the *current* card rather than fetching a new one — the server
+      // still holds this prompt, and switching input mode shouldn't skip a card.
+      if (_cardPrompt) { _drillRecording = false; renderCard(_cardResponse); return; }
       drillNext();
     }
 
     async function drillNext() {
       _drillPractice = false;  // /drill/next is the scheduled queue, always graded
       _drillRecording = false;
+      _cardPrompt = null;      // leaving the card surface
       const body = document.getElementById('drill-body');
       const r = await (await fetch('/drill/next')).json();
-      await loadDrillGrid();
+      await Promise.all([loadDrillGrid(), loadCardGrid()]);
       if (!r.due) {
+        // Scales are clear, but the day isn't done until the harmony cards are too.
+        const cards = await (await fetch('/drill/cards/status')).json();
+        const more = cards.due_today > 0
+          ? `<div class="drill-sub">${cards.due_today} harmony card${cards.due_today === 1 ? '' : 's'} still due.</div>
+             <button class="drill-btn" onclick="cardNext()">Drill harmony</button>`
+          : `<div class="drill-sub">🔥 ${r.streak_days} day streak. Come back tomorrow.</div>`;
         body.innerHTML = `<div class="drill-done">
-            <div class="big">✅ Patch done</div>
-            <div class="drill-sub">🔥 ${r.streak_days} day streak. Come back tomorrow.</div>
+            <div class="big">✅ Scales done</div>
+            ${more}
             <button class="drill-btn secondary" onclick="closeDrill()">Back to chat</button>
           </div>`;
         return;
@@ -2174,6 +2501,15 @@
     window.toggleDrillRecord = toggleDrillRecord;
     window.drillPlayPrompt = drillPlayPrompt;
     window.submitEar = submitEar;
+
+    window.cardNext = cardNext;
+    window.submitCard = submitCard;
+    window.submitCardChoice = submitCardChoice;
+    window.cardPlayPrompt = cardPlayPrompt;
+    window.cardSegment = cardSegment;
+    window.cardHear = cardHear;
+    window.pickFunction = pickFunction;
+    window.toggleCardRecord = toggleCardRecord;
 
     let _playingPollTimer = null;
 

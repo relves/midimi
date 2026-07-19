@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import pytest
 
 from sequencer.theory import major_scale_notes, normalize_note_name
-from sequencer import drill
+from sequencer import drill, drill_cards
 
 
 # ── major_scale_notes — exact enharmonic spelling ────────────────────────────
@@ -224,6 +224,14 @@ def test_maybe_unlock_ignores_ear_rows():
 
 # ── Endpoints (TestClient against a temp DB) ─────────────────────────────────
 
+def _interval_answer(prompt: dict) -> str:
+    """The correct upper note for an interval_spell prompt (answers are server-side)."""
+    from sequencer.theory import chord_note_names
+    import re as _re
+
+    return _re.sub(r"-?\d+$", "", chord_note_names(prompt["root"], prompt["item"])[1])
+
+
 @pytest.fixture
 def client(monkeypatch):
     fd, path = tempfile.mkstemp(suffix=".db")
@@ -242,11 +250,16 @@ def client(monkeypatch):
         os.unlink(path)
 
 
+# A fresh DB seeds both queues: 7 starter scale keys and the first card deck.
+FRESH_DUE = len(drill.STARTER_KEYS) + len(drill_cards.DECKS[drill_cards.KIND_ORDER[0]])
+
+
 def test_next_returns_starter_on_fresh_db(client):
     r = client.get("/drill/next").json()
     assert r["due"] is True
     assert r["key"] in drill.STARTER_KEYS
-    assert r["due_today"] == 7
+    # due_today spans both queues — it drives one badge for the whole session.
+    assert r["due_today"] == FRESH_DUE
     assert r["prompt"].startswith("Spell ")
 
 
@@ -269,23 +282,41 @@ def test_grade_correct_promotes_and_wrong_resets(client):
 
 def test_status_counts_due(client):
     s = client.get("/drill/status").json()
-    assert s["due_today"] == 7
+    assert s["due_today"] == FRESH_DUE
     assert s["done_today"] is False
-    assert len(s["keys"]) == 7
+    assert len(s["keys"]) == 7  # `keys` stays scale-only; cards have their own status
     assert s["streak_days"] == 0
 
 
-def test_full_clear_sets_streak_and_done(client):
-    # Grade every starter key correctly -> queue empties, streak advances to 1.
+def _clear_scale_queue(client):
     for _ in range(len(drill.STARTER_KEYS)):
         nxt = client.get("/drill/next").json()
         if not nxt["due"]:
             break
         key = nxt["key"]
         client.post("/drill/grade", json={"key": key, "answer": major_scale_notes(key)})
-    nxt = client.get("/drill/next").json()
-    assert nxt["due"] is False
-    assert nxt["streak_days"] == 1
+
+
+def test_clearing_scales_alone_does_not_bank_the_day(client):
+    """The streak needs both queues empty — harmony cards still pending holds it."""
+    _clear_scale_queue(client)
+    assert client.get("/drill/next").json()["due"] is False
+    assert client.get("/drill/status").json()["streak_days"] == 0
+    assert client.get("/drill/status").json()["done_today"] is False
+
+
+def test_full_clear_sets_streak_and_done(client):
+    _clear_scale_queue(client)
+    # Now clear the card queue too; only then does the day count.
+    for _ in range(len(drill_cards.DECKS["interval_spell"]) + 1):
+        nxt = client.get("/drill/cards/next").json()
+        if not nxt["due"]:
+            break
+        client.post("/drill/cards/grade", json={
+            "note": _interval_answer(nxt["prompt"]), "graded": True})
+    assert client.get("/drill/next").json()["due"] is False
+    assert client.get("/drill/cards/next").json()["due"] is False
+    assert client.get("/drill/status").json()["streak_days"] == 1
     assert client.get("/drill/status").json()["done_today"] is True
 
 
