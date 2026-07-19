@@ -134,18 +134,26 @@ def ear_choices(key: str, n_distractors: int = 2, rng=None) -> list[str]:
     return choices
 
 
-def grade_played(events: list[dict], key: str) -> dict:
-    """Grade recorded MIDI note-on events against `key` major, pitch-class tolerant.
+def grade_played_notes(
+    events: list[dict],
+    expected_names: list[str],
+    bass_name: str | None = None,
+) -> dict:
+    """Grade recorded MIDI note-on events against expected note names,
+    pitch-class tolerant.
 
     Extracts note-on pitch classes in played order, de-dupes octaves (so a
-    two-octave run still reads as the 7-note set), and compares to the expected
-    pitch-class set. `correct` iff the played PC set == expected set AND no played
-    note falls outside the scale. `played_names` re-spells played notes with the
-    key's correct spelling so a right answer reinforces the spelling.
-    """
-    from sequencer.theory import major_scale_notes, NOTE_NAMES
+    two-octave run still reads as the expected set), and compares to the
+    expected pitch-class set. `correct` iff the played PC set == expected set
+    AND no played note falls outside it. `played_names` re-spells played notes
+    with the expected spelling so a right answer reinforces the spelling.
 
-    expected_names = major_scale_notes(key)
+    `bass_name` (for inversion prompts) additionally requires the lowest played
+    MIDI note to be that pitch class — the one part of voicing a PC set can't
+    check.
+    """
+    from sequencer.theory import NOTE_NAMES
+
     name_by_pc = {NOTE_NAMES[n]: n for n in expected_names}
     expected_pcs = [NOTE_NAMES[n] for n in expected_names]
     expected_set = set(expected_pcs)
@@ -166,7 +174,7 @@ def grade_played(events: list[dict], key: str) -> dict:
     missing_pcs = [pc for pc in expected_pcs if pc not in played_set]
     correct = played_set == expected_set and not wrong_pcs
 
-    return {
+    result = {
         "correct": correct,
         "expected": expected_names,
         "played_midi": played_midi,
@@ -174,3 +182,19 @@ def grade_played(events: list[dict], key: str) -> dict:
         "wrong_notes": [_SHARP[pc] for pc in wrong_pcs],
         "missing_notes": [name_by_pc[pc] for pc in missing_pcs],
     }
+
+    if bass_name is not None:
+        bass_pc = NOTE_NAMES[bass_name]
+        bass_ok = bool(played_midi) and min(played_midi) % 12 == bass_pc
+        result["expected_bass"] = bass_name
+        result["bass_ok"] = bass_ok
+        result["correct"] = correct and bass_ok
+
+    return result
+
+
+def grade_played(events: list[dict], key: str) -> dict:
+    """Grade recorded MIDI note-on events against `key` major (Slice-1 scale drill)."""
+    from sequencer.theory import major_scale_notes
+
+    return grade_played_notes(events, major_scale_notes(key))

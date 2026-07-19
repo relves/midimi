@@ -95,6 +95,11 @@ repertoire.
 
 ## Slice C — Harmony Drill Card Types
 
+**Status: policy layer shipped** — `sequencer/drill_cards.py`, `tests/test_drill_cards.py`.
+See the Harmony drill cards section of the README. All eight kinds (decks, prompt
+generation, grading, week-order unlock chain) exist as pure policy on the existing
+scheduler; still open: `/drill/*` route wiring, persistence rows for (kind, item), and UI.
+
 New prompt/grade pairs on the existing scheduler. Each is small; the value is cumulative.
 
 | Week | Card type | Prompt → answer |

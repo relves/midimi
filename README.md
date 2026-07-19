@@ -148,6 +148,30 @@ repeats:
 The chat agent has `list_charts`, `show_chart`, `start_chart_loop` and `stop_loop`, so
 *"give me a slow blues in F"* starts a running loop rather than a one-shot playback.
 
+## Harmony drill cards
+
+`sequencer/drill_cards.py` adds the study plan's harmony card types on the same Leitner
+scheduler as the scale drill (`sequencer/drill.py`), as a pure prompt/grade policy layer
+(no routes or persistence yet):
+
+| Week | Kind | Prompt → answer |
+|---|---|---|
+| 1 | `interval_spell` | "Major 3rd above E♭" → play or type |
+| 1 | `interval_ear` | hear it → name it |
+| 2 | `triad_spell` | "F♯ diminished" → play; inversions as a variant |
+| 3 | `seventh_spell` / `seventh_ear` | "Cm7♭5" → play; hear → name |
+| 4 | `diatonic` | "ii7 in A♭" → play; "list the diatonic 7ths in E" |
+| 5 | `function` | label T / PD / D on a progression; predict the resolution |
+| 6 | `guide_tones` | "ii–V–I in D, 3rds and 7ths only, rootless" |
+
+Kinds unlock as a chain in week order (`kind_unlocks`, mirroring the scale drill's
+spell-before-ear gating): a kind opens when every card of the previous kind reaches box 3.
+Played answers grade through the same pitch-class-tolerant grader as the scale drill;
+inversion prompts additionally check the bass note's pitch class, and guide-tone grading is
+rootless by construction (any note outside the 3rd+7th set fails). Per the plan, the decks
+deliberately exclude modes, 9/11/13 extensions, bebop vocabulary and advanced rootless
+voicings.
+
 ## Usage tips
 
 - Ask about any music theory concept — chord types, scales, intervals, progressions, modes
