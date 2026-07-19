@@ -190,7 +190,7 @@
     }
 
     /* ── Daily Scale Patch ── */
-    #drill-entry {
+    #drill-entry, #chart-entry {
       margin: 0 12px 8px;
       padding: 10px 12px;
       background: var(--surface);
@@ -207,8 +207,8 @@
       flex-shrink: 0;
       transition: background 0.12s, border-color 0.12s;
     }
-    #drill-entry:hover { background: var(--surface2); border-color: var(--accent); }
-    #drill-entry.active { border-color: var(--accent); background: var(--surface2); }
+    #drill-entry:hover, #chart-entry:hover { background: var(--surface2); border-color: var(--accent); }
+    #drill-entry.active, #chart-entry.active { border-color: var(--accent); background: var(--surface2); }
     #drill-badge {
       font-size: 0.72rem;
       font-weight: 700;
@@ -860,6 +860,165 @@
       color: var(--text-dim);
       min-width: 60px;
     }
+
+    /* ── Chart panel: transport, bar grid, cursor ── */
+
+    #chart-panel {
+      flex: 1;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px;
+      overflow-y: auto;
+      gap: 18px;
+    }
+    #chart-panel.open { display: flex; }
+
+    .chart-shell { width: 100%; max-width: 720px; }
+
+    #chart-transport {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 18px;
+    }
+    #chart-transport select,
+    #chart-transport input {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      padding: 6px 8px;
+      font-size: 0.85rem;
+      font-family: inherit;
+    }
+    #chart-transport input[type="number"] { width: 68px; }
+    #chart-select { flex: 1; min-width: 160px; }
+
+    .chart-btn {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      cursor: pointer;
+      padding: 6px 12px;
+      font-size: 0.85rem;
+      font-family: inherit;
+      transition: border-color 0.15s, background 0.15s, color 0.15s;
+    }
+    .chart-btn:hover { border-color: var(--accent); }
+    .chart-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .chart-btn.primary:hover { background: var(--accent-dim); }
+    .chart-btn.active { border-color: var(--accent); color: var(--accent); }
+
+    #chart-meta {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    #chart-title { font-size: 1.05rem; font-weight: 600; }
+    #chart-subtitle { color: var(--text-dim); font-size: 0.78rem; }
+
+    #chart-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+    }
+
+    .bar-cell {
+      position: relative;
+      min-height: 84px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 10px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      transition: border-color 0.12s, background 0.12s;
+    }
+    .bar-cell .bar-num {
+      font-size: 0.65rem;
+      color: var(--text-dim);
+      font-variant-numeric: tabular-nums;
+    }
+    .bar-cell .bar-slots {
+      display: flex;
+      flex: 1;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+
+    /* The lit cursor cell — this is the whole point of the panel. */
+    .bar-cell.current {
+      border-color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 16%, var(--surface2));
+    }
+    .bar-cell.current .bar-num { color: var(--accent); }
+
+    .slot {
+      flex: 1;
+      text-align: center;
+      font-size: 1.15rem;
+      font-weight: 600;
+      color: var(--text);
+      opacity: 0.55;
+      transition: opacity 0.12s, color 0.12s;
+    }
+    .bar-cell.current .slot { opacity: 0.75; }
+    .slot.playing { opacity: 1; color: var(--accent); }
+
+    /* Roman-numeral overlay is a display toggle over one render, never a refetch. */
+    .slot .as-numeral { display: none; }
+    #chart-grid.numerals .slot .as-symbol { display: none; }
+    #chart-grid.numerals .slot .as-numeral { display: inline; }
+
+    /* Beat ticks along the bottom of the lit cell. */
+    .beat-ticks {
+      display: flex;
+      gap: 4px;
+      justify-content: center;
+      height: 4px;
+    }
+    .beat-ticks i {
+      width: 12px;
+      border-radius: 2px;
+      background: var(--border);
+    }
+    .beat-ticks i.on { background: var(--accent); }
+
+    #chart-status {
+      margin-top: 14px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      font-size: 0.82rem;
+      color: var(--text-dim);
+      min-height: 22px;
+    }
+    #chart-status .next-chord strong { color: var(--text); font-weight: 600; }
+
+    #count-in {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      color: #f0a040;
+      font-weight: 600;
+    }
+    #count-in.on { display: flex; }
+    #count-in .dots { display: flex; gap: 5px; }
+    #count-in .dots i {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--border);
+    }
+    #count-in .dots i.on { background: #f0a040; }
+
+    #chart-error { color: #e06060; font-size: 0.82rem; }
   </style>
 </head>
 <body>
@@ -902,6 +1061,9 @@
           <span>🎯 Daily Scale Patch</span>
           <span id="drill-badge">…</span>
         </button>
+        <button id="chart-entry" onclick="openChart()" title="Play along with a chord chart">
+          <span>🎵 Charts</span>
+        </button>
         <div id="sessions-list">
           <div id="sessions-empty">No sessions yet</div>
         </div>
@@ -914,6 +1076,34 @@
         <div id="drill-grid"></div>
       </div>
       <div id="drill-body" class="drill-card"></div>
+    </div>
+
+    <div id="chart-panel">
+      <div class="chart-shell">
+        <div id="chart-transport">
+          <select id="chart-select" title="Chart"></select>
+          <select id="chart-key" title="Key"></select>
+          <select id="chart-mode" title="Chord qualities"></select>
+          <input id="chart-tempo" type="number" min="40" max="300" step="1" title="Tempo (BPM)" />
+          <button class="chart-btn primary" id="chart-play" onclick="chartPlay()">▶ Play</button>
+          <button class="chart-btn" id="chart-stop" onclick="chartStop()">■ Stop</button>
+          <button class="chart-btn" id="chart-numerals" onclick="toggleNumerals()"
+                  title="Show roman numerals instead of chord symbols">I–IV–V</button>
+        </div>
+
+        <div id="chart-meta">
+          <span id="chart-title"></span>
+          <span id="chart-subtitle"></span>
+        </div>
+
+        <div id="chart-grid"></div>
+
+        <div id="chart-status">
+          <span id="count-in"><span>Count-in</span><span class="dots"></span></span>
+          <span class="next-chord" id="chart-next"></span>
+          <span id="chart-error"></span>
+        </div>
+      </div>
     </div>
 
     <div id="chat-area">
@@ -1422,6 +1612,7 @@
     let _drillPractice = false;  // true = free practice (circle click); never grades the schedule
 
     async function _openDrillPanel() {
+      closeChart();
       document.getElementById('chat-area').style.display = 'none';
       document.getElementById('drill-panel').classList.add('open');
       document.getElementById('drill-entry').classList.add('active');
@@ -1464,12 +1655,268 @@
     }
 
     function closeDrill() {
+      closeChart();
       const panel = document.getElementById('drill-panel');
       if (!panel.classList.contains('open')) return;
       panel.classList.remove('open');
       document.getElementById('drill-entry').classList.remove('active');
       document.getElementById('chat-area').style.display = 'flex';
       loadDrillBadge();
+    }
+
+    // ── Chart panel: transport + bar cursor ──
+    //
+    // The point of this panel is the cursor: the recurring failure mode isn't playing
+    // wrong notes, it's losing the form. Everything else is in service of that.
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g,
+        c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    const CHART_KEYS = ['C','Db','D','Eb','E','F','F#','G','Ab','A','Bb','B'];
+    const MODE_LABELS = {
+      as_written: 'As written',
+      triad: 'Triads',
+      dominant7: 'All dominant 7ths',
+      seventh: 'Diatonic 7ths',
+    };
+
+    let _chartRendered = null;   // last render from GET /charts/{id}
+    let _chartBpb = 4;           // beats per bar, derived from the render
+    let _chartPoll = null;       // interval handle; only runs while the loop plays
+    let _chartNumerals = false;
+
+    async function openChart() {
+      closeDrill();
+      document.getElementById('chat-area').style.display = 'none';
+      document.getElementById('chart-panel').classList.add('open');
+      document.getElementById('chart-entry').classList.add('active');
+
+      if (!document.getElementById('chart-select').options.length) {
+        await loadChartList();
+      }
+      await renderChart();
+      // Pick up a loop that's already running (started from chat, say).
+      pollPosition();
+      startPolling();
+    }
+
+    function closeChart() {
+      const panel = document.getElementById('chart-panel');
+      if (!panel.classList.contains('open')) return;
+      panel.classList.remove('open');
+      document.getElementById('chart-entry').classList.remove('active');
+      document.getElementById('chat-area').style.display = 'flex';
+      stopPolling();
+    }
+
+    async function loadChartList() {
+      const data = await (await fetch('/charts')).json();
+      const sel = document.getElementById('chart-select');
+      sel.innerHTML = data.charts
+        .map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('');
+      sel.onchange = () => renderChart(true);
+
+      const keySel = document.getElementById('chart-key');
+      keySel.innerHTML = CHART_KEYS.map(k => `<option value="${k}">${k}</option>`).join('');
+      keySel.onchange = () => renderChart();
+
+      const modeSel = document.getElementById('chart-mode');
+      modeSel.innerHTML = (data.modes || [])
+        .map(m => `<option value="${m}">${MODE_LABELS[m] || m}</option>`).join('');
+      modeSel.onchange = () => renderChart();
+
+      _chartDefaults = Object.fromEntries(data.charts.map(c => [c.id, c]));
+      applyChartDefaults();
+    }
+
+    let _chartDefaults = {};
+
+    // Reset key/mode/tempo to whatever the selected chart was authored with.
+    function applyChartDefaults() {
+      const c = _chartDefaults[document.getElementById('chart-select').value];
+      if (!c) return;
+      document.getElementById('chart-key').value = c.key;
+      document.getElementById('chart-mode').value = c.default_mode;
+      document.getElementById('chart-tempo').value = Math.round(c.default_tempo_bpm);
+    }
+
+    async function renderChart(resetDefaults) {
+      if (resetDefaults) applyChartDefaults();
+      const id = document.getElementById('chart-select').value;
+      const key = document.getElementById('chart-key').value;
+      const mode = document.getElementById('chart-mode').value;
+      const err = document.getElementById('chart-error');
+      err.textContent = '';
+      try {
+        const r = await fetch(`/charts/${encodeURIComponent(id)}?key=${encodeURIComponent(key)}&mode=${encodeURIComponent(mode)}`);
+        if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+        _chartRendered = await r.json();
+      } catch (e) {
+        err.textContent = String(e.message || e);
+        return;
+      }
+      const totalBeats = _chartRendered.slots.reduce((a, s) => a + s.beats, 0);
+      _chartBpb = totalBeats / _chartRendered.bars;
+      drawChartGrid();
+    }
+
+    function drawChartGrid() {
+      const c = _chartRendered;
+      document.getElementById('chart-title').textContent = c.name;
+      document.getElementById('chart-subtitle').textContent =
+        `${c.key} · ${c.time_signature} · ${c.bars} bars · ${MODE_LABELS[c.mode] || c.mode}`;
+
+      // One cell per bar; slots grouped into the bar they start in, so half-bar
+      // slots (ii–V, the turnaround) share a cell.
+      const byBar = new Map();
+      c.slots.forEach((s, i) => {
+        if (!byBar.has(s.bar)) byBar.set(s.bar, []);
+        byBar.get(s.bar).push({ ...s, index: i });
+      });
+
+      let html = '';
+      for (let bar = 1; bar <= c.bars; bar++) {
+        const slots = byBar.get(bar) || [];
+        const cells = slots.map(s => `
+            <span class="slot" data-slot="${s.index}">
+              <span class="as-symbol">${escapeHtml(s.symbol)}</span
+              ><span class="as-numeral">${escapeHtml(s.numeral)}</span>
+            </span>`).join('');
+        html += `
+          <div class="bar-cell" data-bar="${bar}">
+            <span class="bar-num">${bar}</span>
+            <span class="bar-slots">${cells}</span>
+            <span class="beat-ticks"></span>
+          </div>`;
+      }
+      const grid = document.getElementById('chart-grid');
+      grid.innerHTML = html;
+      grid.classList.toggle('numerals', _chartNumerals);
+    }
+
+    function toggleNumerals() {
+      _chartNumerals = !_chartNumerals;
+      document.getElementById('chart-grid').classList.toggle('numerals', _chartNumerals);
+      const btn = document.getElementById('chart-numerals');
+      btn.classList.toggle('active', _chartNumerals);
+      btn.textContent = _chartNumerals ? 'C–F–G' : 'I–IV–V';
+    }
+
+    async function chartPlay() {
+      const err = document.getElementById('chart-error');
+      err.textContent = '';
+      const body = {
+        chart_id: document.getElementById('chart-select').value,
+        key: document.getElementById('chart-key').value,
+        mode: document.getElementById('chart-mode').value,
+        tempo_bpm: Number(document.getElementById('chart-tempo').value) || null,
+      };
+      try {
+        const r = await fetch('/charts/loop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+        const data = await r.json();
+        _chartRendered = data.chart;
+        const totalBeats = _chartRendered.slots.reduce((a, s) => a + s.beats, 0);
+        _chartBpb = totalBeats / _chartRendered.bars;
+        drawChartGrid();
+        applyPosition(data.position);
+        startPolling();
+      } catch (e) {
+        err.textContent = String(e.message || e);
+      }
+    }
+
+    async function chartStop() {
+      try { await fetch('/loop/stop', { method: 'POST' }); } catch (e) { /* ignore */ }
+      stopPolling();
+      clearCursor();
+    }
+
+    function startPolling() {
+      if (_chartPoll) return;
+      _chartPoll = setInterval(pollPosition, 80);
+    }
+
+    function stopPolling() {
+      if (_chartPoll) clearInterval(_chartPoll);
+      _chartPoll = null;
+    }
+
+    async function pollPosition() {
+      let pos;
+      try { pos = await (await fetch('/loop/position')).json(); } catch (e) { return; }
+      applyPosition(pos);
+      // Nothing to track once the transport is idle — stop hammering the endpoint.
+      if (!pos.playing) { stopPolling(); clearCursor(); }
+    }
+
+    function applyPosition(pos) {
+      if (!pos || !pos.playing) { clearCursor(); return; }
+
+      const countIn = document.getElementById('count-in');
+      countIn.classList.toggle('on', !!pos.count_in);
+      if (pos.count_in) {
+        const total = pos.count_in_beats || _chartBpb;
+        countIn.querySelector('.dots').innerHTML = Array.from({ length: total },
+          (_, i) => `<i class="${i < pos.count_in_beat ? 'on' : ''}"></i>`).join('');
+        clearCursor(true);
+        document.getElementById('chart-next').innerHTML =
+          `up first: <strong>${escapeHtml(pos.chord)}</strong>`;
+        return;
+      }
+
+      // Bar cursor.
+      const grid = document.getElementById('chart-grid');
+      grid.querySelectorAll('.bar-cell.current').forEach(el => el.classList.remove('current'));
+      const cell = grid.querySelector(`.bar-cell[data-bar="${pos.bar}"]`);
+      if (cell) {
+        cell.classList.add('current');
+        const bpb = Math.round(_chartBpb);
+        cell.querySelector('.beat-ticks').innerHTML = Array.from({ length: bpb },
+          (_, i) => `<i class="${i < pos.beat ? 'on' : ''}"></i>`).join('');
+      }
+      grid.querySelectorAll('.beat-ticks').forEach(t => {
+        if (!t.closest('.bar-cell').classList.contains('current')) t.innerHTML = '';
+      });
+
+      // Active slot within the bar. Derived from position_beats against the rendered
+      // slots' own beat grid — chord symbols repeat across a form, so matching on
+      // pos.chord would light the wrong cell.
+      grid.querySelectorAll('.slot.playing').forEach(el => el.classList.remove('playing'));
+      const idx = slotIndexAt(pos.position_beats);
+      if (idx >= 0) {
+        const el = grid.querySelector(`.slot[data-slot="${idx}"]`);
+        if (el) el.classList.add('playing');
+      }
+
+      document.getElementById('chart-next').innerHTML =
+        `next: <strong>${escapeHtml(pos.next_chord)}</strong>`;
+    }
+
+    function slotIndexAt(beats) {
+      if (!_chartRendered || beats == null) return -1;
+      const slots = _chartRendered.slots;
+      for (let i = 0; i < slots.length; i++) {
+        if (beats >= slots[i].start_beat && beats < slots[i].start_beat + slots[i].beats) return i;
+      }
+      return -1;
+    }
+
+    function clearCursor(keepCountIn) {
+      const grid = document.getElementById('chart-grid');
+      grid.querySelectorAll('.bar-cell.current').forEach(el => el.classList.remove('current'));
+      grid.querySelectorAll('.slot.playing').forEach(el => el.classList.remove('playing'));
+      grid.querySelectorAll('.beat-ticks').forEach(t => { t.innerHTML = ''; });
+      if (!keepCountIn) {
+        document.getElementById('count-in').classList.remove('on');
+        document.getElementById('chart-next').textContent = '';
+      }
     }
 
     // ── Circle-of-fifths mastery grid ──
@@ -1710,6 +2157,12 @@
         setTimeout(() => playMidiNote(m), step++ * 350);
       });
     }
+
+    window.openChart = openChart;
+    window.closeChart = closeChart;
+    window.chartPlay = chartPlay;
+    window.chartStop = chartStop;
+    window.toggleNumerals = toggleNumerals;
 
     window.openDrill = openDrill;
     window.practiceKey = practiceKey;
