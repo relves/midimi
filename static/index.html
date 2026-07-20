@@ -311,7 +311,8 @@
       gap: 8px; padding: 3px 6px; border-radius: 6px; cursor: pointer;
     }
     .card-row:hover { background: var(--surface2); }
-    .card-row.locked { opacity: 0.38; cursor: not-allowed; }
+    .card-row.locked { opacity: 0.38; }
+    .card-row.locked:hover { opacity: 0.62; }
     .card-row .kind-name {
       font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em;
       color: var(--text-dim); text-align: right;
@@ -2024,8 +2025,15 @@ let _cardSegments = 0;       // guide tones: chords captured so far
           const title = `${i.item}: ${i.box ? 'box ' + i.box : 'locked'}${i.due ? ' · due now' : ''}`;
           return `<span class="card-pip ${i.due ? 'due' : ''}" style="background:${fill}" title="${title}"></span>`;
         }).join('');
-        const click = k.unlocked ? 'onclick="cardNext()"' : '';
-        const title = k.unlocked ? 'Click to drill harmony cards' : 'Locked — master the kind above first';
+        // Unlocked rows drive the normal progression (serve whatever's due);
+        // any row can also be launched directly — a dev/testing jump that
+        // bypasses the unlock gate without touching the progression.
+        const click = k.unlocked
+          ? `onclick="cardNext()"`
+          : `onclick="cardNext('${k.kind}')"`;
+        const title = k.unlocked
+          ? 'Click to drill harmony cards'
+          : 'Locked — click to jump in anyway (practice only, no progress saved)';
         return `<div class="card-row ${k.unlocked ? '' : 'locked'}" ${click} title="${title}">
             <span class="kind-name">${KIND_LABELS[k.kind] || k.kind}</span>
             <span class="pips">${pips}</span>
@@ -2034,11 +2042,12 @@ let _cardSegments = 0;       // guide tones: chords captured so far
       }).join('');
     }
 
-    async function cardNext() {
+    async function cardNext(kind) {
       _cardSegments = 0;
       _drillRecording = false;
       const body = document.getElementById('drill-body');
-      const r = await (await fetch('/drill/cards/next')).json();
+      const url = kind ? `/drill/cards/next?kind=${encodeURIComponent(kind)}` : '/drill/cards/next';
+      const r = await (await fetch(url)).json();
       await loadCardGrid();
       if (!r.due) {
         _cardPrompt = null;

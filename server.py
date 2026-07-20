@@ -830,6 +830,24 @@ def _card_rows() -> list[dict]:
     return out
 
 
+def _pick_forced_card(rows: list[dict], kind: str, now: int) -> dict | None:
+    """A card row for `kind` regardless of unlock state (dev jump-to-drill).
+
+    Prefers a due item, then the most-overdue existing row, then a fresh deck
+    item (box 1). Returns None if `kind` isn't a real card kind.
+    """
+    deck = drill_cards.DECKS.get(kind)
+    if deck is None:
+        return None
+    mine = [r for r in rows if r.get("kind") == kind]
+    due = [r for r in mine if r.get("due_at") is not None and r["due_at"] <= now]
+    if due:
+        return min(due, key=lambda r: (r["due_at"], r["key"]))
+    if mine:
+        return min(mine, key=lambda r: (r.get("due_at") or 0, r["key"]))
+    return {"kind": kind, "item": random.choice(list(deck)), "box": 1}
+
+
 def _total_due(now: int) -> int:
     """Everything due across both queues — what the badge and "N due today" mean."""
     return _drill_due_count(_drill_rows(), now) + _drill_due_count(_card_rows(), now)
@@ -1185,7 +1203,9 @@ def _card_apply_grade(kind: str, item: str, correct: bool, now: int) -> tuple[in
     """
     row = _card_row(kind, item)
     if row is None:
-        raise HTTPException(404, f"Card not active: {kind}/{item}")
+        # Forced jump into a not-yet-unlocked kind (dev/testing): practice only,
+        # don't seed a row or the drill would "unlock" itself in the grid.
+        return 0, _drill_streak_days()
 
     new_box, new_due = drill.schedule_after(row["box"], correct, now)
     conn = sqlite3.connect(DB_PATH)
@@ -1233,14 +1253,25 @@ class CardGradeRequest(BaseModel):
 
 
 @app.get("/drill/cards/next")
-def drill_cards_next():
-    """Pick the most-overdue card, build its prompt, and stash it for grading."""
+def drill_cards_next(kind: str | None = None):
+    """Pick the most-overdue card, build its prompt, and stash it for grading.
+
+    With `?kind=...` (a dev/testing affordance) the progression is bypassed: it
+    serves that kind directly regardless of unlock state, preferring a due item
+    of that kind, else the most-overdue existing row, else a fresh deck item.
+    """
     global _card_prompt, _card_segments
     now = int(time.time())
     rows = _card_rows()
-    nxt = drill.pick_next(rows, now)
-    if nxt is None:
-        return {"due": False, "streak_days": _drill_streak_days(), "due_today": 0}
+
+    if kind is not None:
+        nxt = _pick_forced_card(rows, kind, now)
+        if nxt is None:
+            raise HTTPException(400, f"Unknown card kind: {kind}")
+    else:
+        nxt = drill.pick_next(rows, now)
+        if nxt is None:
+            return {"due": False, "streak_days": _drill_streak_days(), "due_today": 0}
 
     kind, item = nxt["kind"], nxt["item"]
     # Wk2 inversion variant, offered only once the root-position row is established.

@@ -532,3 +532,37 @@ def test_triad_inversion_does_not_leak_the_bass_note(client):
         conn.execute("UPDATE card_drill SET due_at=1 WHERE kind='triad_spell'")
         conn.commit()
         conn.close()
+
+
+def test_jump_to_locked_kind_bypasses_the_unlock_gate(client):
+    """`?kind=` serves a locked kind directly (dev jump-to-drill)."""
+    # guide_tones is the last kind and locked on a fresh DB.
+    status = {k["kind"]: k for k in client.get("/drill/cards/status").json()["kinds"]}
+    assert status["guide_tones"]["unlocked"] is False
+
+    r = client.get("/drill/cards/next", params={"kind": "guide_tones"}).json()
+    assert r["due"] is True
+    assert r["prompt"]["kind"] == "guide_tones"
+
+
+def test_jump_to_unknown_kind_is_a_400(client):
+    r = client.get("/drill/cards/next", params={"kind": "nope"})
+    assert r.status_code == 400
+
+
+def test_jump_into_locked_kind_does_not_seed_or_unlock(client):
+    """Practising a locked kind must not create rows that would unlock it."""
+    client.get("/drill/cards/next", params={"kind": "guide_tones"})
+    # Answer it (graded); a not-yet-unlocked kind must stay locked afterwards.
+    client.post("/drill/cards/grade", json={"symbols": [], "graded": True})
+
+    status = {k["kind"]: k for k in client.get("/drill/cards/status").json()["kinds"]}
+    assert status["guide_tones"]["unlocked"] is False
+
+
+def test_jump_prefers_a_due_item_of_that_kind(client):
+    """When rows exist, the jump serves that kind (interval_ear is locked but seeded here)."""
+    _seed("interval_ear", "P5", due_at=1)
+    r = client.get("/drill/cards/next", params={"kind": "interval_ear"}).json()
+    assert r["prompt"]["kind"] == "interval_ear"
+    assert r["prompt"]["item"] == "P5"
