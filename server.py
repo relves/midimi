@@ -384,7 +384,7 @@ def generate_title_async(session_id: str, first_user_message: str):
     def _gen():
         try:
             resp = get_anthropic_client().messages.create(
-                model="claude-haiku-4-5-20251001",
+                model="claude-sonnet-4-6",
                 max_tokens=20,
                 messages=[{"role": "user", "content": (
                     f'Give a 3-5 word title for a music theory conversation that starts with: '
@@ -1721,7 +1721,6 @@ def charts_loop(req: ChartLoopRequest):
 
 
 ALLOWED_MODELS = {
-    "claude-haiku-4-5-20251001",
     "claude-sonnet-4-6",
     "claude-opus-4-7",
 }
@@ -1735,7 +1734,7 @@ class ImageAttachment(BaseModel):
 class ChatRequest(BaseModel):
     session_id: str
     message: str
-    model: str = "claude-haiku-4-5-20251001"
+    model: str = "claude-sonnet-4-6"
     images: list[ImageAttachment] = Field(default_factory=list)
 
 
