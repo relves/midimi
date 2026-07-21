@@ -20,7 +20,7 @@ from sequencer.abc import parse_abc, to_abc, ABCParseError, per_bar_report
 from sequencer.theory import (
     normalize_chord_quality, chord_note_names, build_chord, parse_pitch,
     NOTE_NAMES, CHORD_INTERVALS, midi_note_name as _theory_midi_note_name,
-    major_scale_notes, normalize_note_name,
+    major_scale_notes, normalize_note_name, key_prefers_flats,
 )
 import sequencer.model as seq_model
 import sequencer.engine as engine
@@ -38,6 +38,15 @@ from pydantic import BaseModel, Field
 
 
 midi_note_name = _theory_midi_note_name
+
+
+def prefer_flats_for(root: str = "", quality: str = "") -> bool:
+    """Spell an ad-hoc set of notes with flats or sharps, given its chord context.
+
+    Defers to key_prefers_flats so a bare root and a full "Db minor" agree; an
+    unknown or empty root falls back to sharps.
+    """
+    return bool(key_prefers_flats(f"{root or ''} {quality or ''}".strip()))
 
 
 SOUNDFONT = os.environ.get("SOUNDFONT", str(Path.home() / "Music" / "GeneralUser-GS.sf2"))
