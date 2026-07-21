@@ -1204,6 +1204,17 @@
     }
 
     let sessionId = null;
+    let knownSessions = [];
+    const LAST_SESSION_KEY = 'midimi.lastSessionId';
+
+    function rememberSession(sid) {
+      sessionId = sid;
+      try {
+        if (sid) localStorage.setItem(LAST_SESSION_KEY, sid);
+        else localStorage.removeItem(LAST_SESSION_KEY);
+      } catch (e) { /* private mode — restore just falls back to most recent */ }
+    }
+
     let currentStream = null;
     let sidebarOpen = true;
     let pendingImages = [];
@@ -1218,6 +1229,7 @@
       try {
         const r = await fetch('/sessions');
         const sessions = await r.json();
+        knownSessions = sessions;
         const list = document.getElementById('sessions-list');
 
         if (sessions.length === 0) {
@@ -1391,7 +1403,7 @@
     async function switchSession(sid) {
       if (sid === sessionId) { closeDrill(); return; }
       closeDrill();
-      sessionId = sid;
+      rememberSession(sid);
       markActiveSession();
 
       const transcript = document.getElementById('transcript');
@@ -1436,17 +1448,17 @@
     async function deleteSession(sid) {
       await fetch(`/session/${sid}`, { method: 'DELETE' });
       if (sid === sessionId) {
-        sessionId = null;
+        rememberSession(null);
       }
       await loadSessions();
       if (!sessionId) {
-        const items = document.querySelectorAll('.session-item');
-        if (items.length > 0) {
-          await switchSession(items[0].dataset.sid);
+        const next = mostRecentSession();
+        if (next) {
+          await switchSession(next.id);
         } else {
           const r = await fetch('/session/new');
           const data = await r.json();
-          sessionId = data.id;
+          rememberSession(data.id);
           await loadSessions();
           markActiveSession();
           showEmptyState();
@@ -1458,7 +1470,7 @@
       closeDrill();
       const r = await fetch('/session/new');
       const data = await r.json();
-      sessionId = data.id;
+      rememberSession(data.id);
       showEmptyState();
       await loadSessions();
       markActiveSession();
@@ -1477,16 +1489,34 @@
 
       loadDrillBadge();
       await loadSessions();
-      const items = document.querySelectorAll('.session-item');
-      if (items.length > 0) {
-        await switchSession(items[0].dataset.sid);
+
+      // Restore the session we were last in. The sidebar lists starred sessions
+      // first, so DOM order is not recency — never restore by list position.
+      let restore = null;
+      try {
+        const last = localStorage.getItem(LAST_SESSION_KEY);
+        if (last) restore = knownSessions.find(s => s.id === last) || null;
+      } catch (e) { /* ignore */ }
+      if (!restore) restore = mostRecentSession();
+
+      if (restore) {
+        await switchSession(restore.id);
       } else {
         const r = await fetch('/session/new');
         const data = await r.json();
-        sessionId = data.id;
+        rememberSession(data.id);
         await loadSessions();
         markActiveSession();
       }
+    }
+
+    // Most recently touched session, independent of starred-first sidebar order.
+    function mostRecentSession() {
+      let best = null;
+      for (const s of knownSessions) {
+        if (!best || (s.modified_at || 0) > (best.modified_at || 0)) best = s;
+      }
+      return best;
     }
 
     function suggest(btn) {
