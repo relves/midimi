@@ -342,6 +342,12 @@
     .gt-step.done { border-color: #50c878; color: #7fe0a0; }
 
     .drill-choices { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin: 18px 0; }
+    .drill-explain {
+      margin-top: 22px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+    }
+
     .drill-choice {
       min-width: 64px; padding: 14px 18px; font-size: 1.05rem; font-weight: 700; cursor: pointer;
       background: var(--surface); border: 1px solid var(--accent-dim); border-radius: 10px; color: var(--text);
@@ -349,6 +355,31 @@
     .drill-choice:hover { border-color: var(--accent); background: var(--surface2); }
     .drill-choice.right { background: rgba(80,200,120,0.18); border-color: #50c878; color: #7fe0a0; }
     .drill-choice.wrong { background: rgba(224,112,112,0.18); border-color: #e07070; color: #f0a0a0; }
+
+    /* Escape hatch back to the drill. Deliberately loud: it appears only while a
+       card is parked, and the whole point is that it's impossible to miss. */
+    #return-to-patch {
+      display: none;
+      flex-shrink: 0;
+      margin: 12px 20px 0;
+      padding: 14px 18px;
+      border-radius: 10px;
+      background: var(--accent);
+      color: #12101c;
+      font-weight: 700;
+      font-size: 1rem;
+      cursor: pointer;
+      text-align: center;
+      line-height: 1.35;
+    }
+    #return-to-patch:hover { background: #9b8dff; }
+    #return-to-patch.show { display: block; }
+    #return-to-patch .sub {
+      display: block;
+      font-size: 0.72rem;
+      font-weight: 600;
+      opacity: 0.7;
+    }
 
     #chat-area {
       flex: 1;
@@ -1146,6 +1177,10 @@
     </div>
 
     <div id="chat-area">
+      <div id="return-to-patch" onclick="returnToPatch()">
+        <span>↩ Return to Patch</span>
+        <span class="sub">Your place in the card sequence is held</span>
+      </div>
       <div id="transcript">
         <div class="empty-state" id="empty-state">
           <div class="icon">🎹</div>
@@ -1403,6 +1438,7 @@
     async function switchSession(sid) {
       if (sid === sessionId) { closeDrill(); return; }
       closeDrill();
+      document.getElementById('return-to-patch').classList.remove('show');
       rememberSession(sid);
       markActiveSession();
 
@@ -1468,6 +1504,9 @@
 
     async function startNewSession() {
       closeDrill();
+      // Wandering off to another chat ends the detour; the button is only honest
+      // while you're in the session that was seeded from a card.
+      document.getElementById('return-to-patch').classList.remove('show');
       const r = await fetch('/session/new');
       const data = await r.json();
       rememberSession(data.id);
@@ -1686,6 +1725,7 @@
 
     async function _openDrillPanel() {
       closeChart();
+      document.getElementById('return-to-patch').classList.remove('show');
       document.getElementById('chat-area').style.display = 'none';
       document.getElementById('drill-panel').classList.add('open');
       document.getElementById('drill-entry').classList.add('active');
@@ -1723,8 +1763,10 @@
         <div class="drill-prompt">${prompt}</div>
         <div class="drill-sub">${sub}</div>
         <div id="drill-input-area"></div>
-        <div class="drill-result" id="drill-result"></div>`;
+        <div class="drill-result" id="drill-result"></div>
+        <div class="drill-explain">${explainBtn()}</div>`;
       renderDrillInput();
+      _cardRestore = () => renderSpellCard(key, prompt, sub);
     }
 
     function closeDrill() {
@@ -1735,6 +1777,48 @@
       document.getElementById('drill-entry').classList.remove('active');
       document.getElementById('chat-area').style.display = 'flex';
       loadDrillBadge();
+    }
+
+    // ── "Instruct me": bail out of a card into a chat about it, then come back ──
+    //
+    // Every card render registers how to redraw *itself* here. That's what makes the
+    // round trip lossless: returning replays the stored render instead of asking the
+    // server for the next card, so the SRS queue never advances behind the user's back.
+    let _cardRestore = null;
+
+    function explainBtn() {
+      return `<button class="drill-btn secondary" onclick="explainCard()"
+                title="Ask Claude about this card, then come straight back">💡 Instruct me</button>`;
+    }
+
+    // The card's own prompt is the seed — it already reads as a question
+    // ("Major 6th above B"), so the framing just asks for the reasoning behind it.
+    function explainQuestion(text) {
+      return `Explain what "${text}" is and why.\n\n`
+        + `I'm on a practice card asking exactly that. Walk me through the answer and the `
+        + `reasoning, so I can work the next one out myself.`;
+    }
+
+    async function explainCard() {
+      const body = document.getElementById('drill-body');
+      const promptEl = body.querySelector('.drill-prompt');
+      const text = (promptEl ? promptEl.textContent : '').replace(/^🔊\s*/, '').trim();
+      if (!text) return;
+
+      closeDrill();
+      await startNewSession();
+      document.getElementById('return-to-patch').classList.add('show');
+      const input = document.getElementById('message-input');
+      input.value = explainQuestion(text);
+      input.dispatchEvent(new Event('input'));
+      await sendMessage();
+    }
+
+    async function returnToPatch() {
+      document.getElementById('return-to-patch').classList.remove('show');
+      if (!_cardRestore) { await openDrill(); return; }
+      await _openDrillPanel();
+      _cardRestore();
     }
 
     // ── Chart panel: transport + bar cursor ──
@@ -2139,7 +2223,9 @@ let _cardSegments = 0;       // guide tones: chords captured so far
         <div class="drill-prompt">${p.kind.endsWith('_ear') ? '🔊 ' : ''}${escapeHtml(p.text)}</div>
         <div class="drill-sub">${sub}</div>
         <div id="drill-input-area">${input}</div>
-        <div class="drill-result" id="drill-result"></div>`;
+        <div class="drill-result" id="drill-result"></div>
+        <div class="drill-explain">${explainBtn()}</div>`;
+      _cardRestore = () => { _cardPrompt = r.prompt; _cardResponse = r; renderCard(r); };
 
       const answer = document.getElementById('drill-answer');
       if (answer) {
@@ -2356,12 +2442,15 @@ let _cardSegments = 0;       // guide tones: chords captured so far
       if (r.direction === 'ear') {
         const choices = (r.choices || []).map(k =>
           `<button class="drill-choice" data-key="${k}" onclick="submitEar('${k}')">${k}</button>`).join('');
-        body.innerHTML = `
+        const html = `
           <div class="drill-prompt">🔊 Name the key</div>
           <div class="drill-sub">${r.due_today} due today · listen, then choose</div>
           <div><button class="drill-btn secondary" onclick="drillPlayPrompt()">▶ Play scale</button></div>
           <div class="drill-choices">${choices}</div>
-          <div class="drill-result" id="drill-result"></div>`;
+          <div class="drill-result" id="drill-result"></div>
+          <div class="drill-explain">${explainBtn()}</div>`;
+        body.innerHTML = html;
+        _cardRestore = () => { body.innerHTML = html; drillPlayPrompt(); };
         drillPlayPrompt();
         return;
       }
