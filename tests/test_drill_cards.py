@@ -72,6 +72,31 @@ def test_interval_spelling_is_diatonic():
     assert p["answer_note"] == "G"
 
 
+def test_interval_cards_never_spell_a_double_accidental():
+    # Db+m2 (Ebb), Db+m6 (Bbb) and Ab+m2 (Bbb) are diatonically correct but
+    # hostile to name; make_prompt respells the root to its enharmonic partner.
+    forced = {
+        ("Db", "m2"): ("C#", ["C#", "D"]),
+        ("Db", "m6"): ("C#", ["C#", "A"]),
+        ("Ab", "m2"): ("G#", ["G#", "A"]),
+    }
+    for root in dc.PROMPT_ROOTS:
+        for item in dc.INTERVALS:
+            p = dc.make_prompt("interval_spell", item, rng=_FixedRoot(root))
+            assert not dc._has_double_accidental(p["expected"]), (root, item, p)
+            if (root, item) in forced:
+                exp_root, exp_notes = forced[(root, item)]
+                assert p["root"] == exp_root and p["expected"] == exp_notes
+
+
+class _FixedRoot:
+    def __init__(self, root):
+        self._root = root
+
+    def choice(self, seq):
+        return self._root
+
+
 def test_interval_typed_grade_enharmonic_tolerant():
     assert dc.grade_typed_note("G", "G")["correct"]
     res = dc.grade_typed_note("Cb", "B")

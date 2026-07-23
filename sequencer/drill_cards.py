@@ -118,6 +118,10 @@ def _bare(name: str) -> str:
     return re.sub(r"-?\d+$", "", name)
 
 
+def _has_double_accidental(names: list[str]) -> bool:
+    return any("bb" in n or "##" in n for n in names)
+
+
 def _chord_names(root: str, quality: str) -> list[str]:
     from sequencer.theory import chord_note_names
 
@@ -227,6 +231,18 @@ def make_prompt(kind: str, item: str, rng=None, inversion: int | None = None) ->
     if kind in ("interval_spell", "interval_ear"):
         root = rng.choice(PROMPT_ROOTS)
         notes = _chord_names(root, item)
+        # A few (root, interval) pairs spell the answer with a double accidental
+        # (e.g. minor 6th above Db is Bbb). They're correct but hostile to name,
+        # so respell the root to its enharmonic partner (Db->C#), which lands the
+        # answer on a single accidental (C# minor 6th -> A).
+        if _has_double_accidental(notes):
+            from sequencer.theory import _ENHARMONIC_PARTNER
+
+            partner = _ENHARMONIC_PARTNER.get(root)
+            if partner is not None:
+                alt = _chord_names(partner, item)
+                if not _has_double_accidental(alt):
+                    root, notes = partner, alt
         if kind == "interval_spell":
             return {
                 "kind": kind, "item": item,
