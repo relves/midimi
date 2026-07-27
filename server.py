@@ -763,6 +763,12 @@ def session_history(session_id: str):
                         "abc": abc_text,
                         "midi_url": f"/sequence/{sequence_id}/download",
                     })
+                elif p.get("type") == "loop" and p.get("chart"):
+                    items.append({
+                        "type": "loop",
+                        "chart": p["chart"],
+                        "options": p.get("options", {}),
+                    })
             if items:
                 result.append({"role": "assistant", "items": items})
     return result
