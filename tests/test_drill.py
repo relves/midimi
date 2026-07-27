@@ -198,6 +198,19 @@ def test_ear_choices_three_distractors():
     assert "G" in choices
 
 
+def test_ear_choices_never_offers_an_enharmonic_of_the_answer():
+    # Gb and F# sound identical, so offering both makes the prompt unanswerable
+    # by ear — and grading marks the musically correct hearing wrong.
+    from sequencer.theory import NOTE_NAMES
+
+    for key in drill.ROTATION:
+        choices = drill.ear_choices(key, n_distractors=2, rng=_NoShuffle())
+        pcs = [NOTE_NAMES[c] for c in choices]
+        assert len(choices) == 3
+        assert len(set(pcs)) == 3, f"{key}: enharmonic choices {choices}"
+        assert key in choices
+
+
 # ── direction-aware scheduling / unlock ──────────────────────────────────────
 
 def test_ear_unlocks_only_at_spell_box3():

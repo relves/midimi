@@ -117,18 +117,29 @@ def ear_choices(key: str, n_distractors: int = 2, rng=None) -> list[str]:
     """Multiple-choice options for an `ear` prompt: the true `key` plus distinct
     circle-of-fifths neighbours as distractors. Never repeats the answer.
 
-    Neighbours (closest fifths first) make plausible distractors. Pass an `rng`
-    with `.shuffle` for deterministic tests; defaults to module `random`.
+    Neighbours (closest fifths first) make plausible distractors. Enharmonic
+    equivalents of the answer (F#/Gb, B/Cb, Db/C#) are excluded: they sound
+    identical, so offering one makes the prompt unanswerable by ear and grading
+    would mark a musically correct hearing wrong.
+
+    Pass an `rng` with `.shuffle` for deterministic tests; defaults to module
+    `random`.
     """
     import random as _random
 
+    from sequencer.theory import NOTE_NAMES
+
     rng = rng or _random
+    seen_pcs = {NOTE_NAMES[key]}
     idx = ROTATION.index(key)
     neighbours: list[str] = []
-    for off in (1, -1, 2, -2, 3, -3, 4, -4):
+    for off in (1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6):
         cand = ROTATION[(idx + off) % len(ROTATION)]
-        if cand != key and cand not in neighbours:
-            neighbours.append(cand)
+        pc = NOTE_NAMES[cand]
+        if pc in seen_pcs:
+            continue
+        seen_pcs.add(pc)
+        neighbours.append(cand)
     choices = [key] + neighbours[:max(0, n_distractors)]
     rng.shuffle(choices)
     return choices
