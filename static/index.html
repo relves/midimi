@@ -609,6 +609,28 @@
       flex-direction: column;
     }
 
+    /* Loop pill: the form the transport is chewing through, under the fold. */
+    .loop-panel {
+      padding: 10px;
+      overflow-x: auto;
+    }
+    .loop-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(64px, 1fr));
+      gap: 6px;
+      min-width: 300px;
+    }
+    .loop-grid .bar-cell {
+      min-height: 52px;
+      padding: 5px 6px 7px;
+      gap: 4px;
+    }
+    .loop-grid .slot { font-size: 0.92rem; }
+    .loop-grid .beat-ticks i { width: 8px; }
+    .loop-grid.numerals .slot .as-symbol { display: none; }
+    .loop-grid.numerals .slot .as-numeral { display: inline; }
+    .loop-pill .loop-toggle.active { color: var(--accent); border-color: var(--accent); }
+
     .message-images {
       display: flex;
       flex-wrap: wrap;
@@ -1428,6 +1450,8 @@
           wrap.appendChild(pill);
           wrap.appendChild(staffPanel);
           bubble.appendChild(wrap);
+        } else if (item.type === 'loop' && item.chart) {
+          bubble.appendChild(buildLoopPill(item.chart, item.options));
         }
       }
       div.appendChild(bubble);
@@ -1977,6 +2001,8 @@
         });
         if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
         const data = await r.json();
+        // One transport: whichever chat pill held the cursor no longer does.
+        clearLoopPill();
         _chartRendered = data.chart;
         const totalBeats = _chartRendered.slots.reduce((a, s) => a + s.beats, 0);
         _chartBpb = totalBeats / _chartRendered.bars;
@@ -2074,6 +2100,183 @@
         document.getElementById('chart-next').textContent = '';
       }
     }
+
+    // ── Loop pills in the chat ──
+    //
+    // Same transport as the chart panel — there is only ever one loop running — but
+    // rendered inline next to the conversation that asked for it, so the user can start
+    // and stop the thing they were just told about without leaving the chat.
+
+    let _loopPill = null;        // the pill currently driving the transport
+    let _loopPillPoll = null;
+
+    function loopGridHtml(chart) {
+      const byBar = new Map();
+      chart.slots.forEach((s, i) => {
+        if (!byBar.has(s.bar)) byBar.set(s.bar, []);
+        byBar.get(s.bar).push({ ...s, index: i });
+      });
+      let html = '';
+      for (let bar = 1; bar <= chart.bars; bar++) {
+        const cells = (byBar.get(bar) || []).map(s => `
+            <span class="slot" data-slot="${s.index}"
+              ><span class="as-symbol">${escapeHtml(s.symbol)}</span
+              ><span class="as-numeral">${escapeHtml(s.numeral)}</span
+            ></span>`).join('');
+        html += `
+          <div class="bar-cell" data-bar="${bar}">
+            <span class="bar-num">${bar}</span>
+            <span class="bar-slots">${cells}</span>
+            <span class="beat-ticks"></span>
+          </div>`;
+      }
+      return html;
+    }
+
+    function buildLoopPill(chart, options) {
+      options = options || {};
+      const wrap = document.createElement('div');
+      wrap.className = 'pill-wrap';
+
+      const pill = document.createElement('div');
+      pill.className = 'audio-pill loop-pill';
+      pill._chart = chart;
+      pill._options = options;
+
+      const tempo = Math.round(options.tempo_bpm || chart.tempo_bpm);
+      const meta = [chart.key, `${tempo} bpm`, options.feel || chart.feel, `${chart.bars} bars`];
+      if (options.repeats) meta.push(`${options.repeats}x`);
+      pill.innerHTML =
+        `<button class="play-btn" title="Play this loop">▶</button>` +
+        `<span class="pill-label">⟳ ${escapeHtml(chart.name || 'Chord loop')}</span>` +
+        `<span class="sequence-meta">${escapeHtml(meta.join(' · '))}</span>` +
+        `<button class="staff-btn loop-numerals" title="Toggle roman numerals">I–IV–V</button>` +
+        `<button class="staff-btn loop-fold open" title="Hide the form">▾</button>`;
+
+      const panel = document.createElement('div');
+      panel.className = 'staff-panel loop-panel open';
+      const grid = document.createElement('div');
+      grid.className = 'loop-grid';
+      grid.innerHTML = loopGridHtml(chart);
+      panel.appendChild(grid);
+      pill._grid = grid;
+
+      pill.querySelector('.play-btn').addEventListener('click', () => toggleLoopPill(pill));
+      pill.querySelector('.loop-numerals').addEventListener('click', function () {
+        const on = grid.classList.toggle('numerals');
+        this.classList.toggle('open', on);
+        this.textContent = on ? 'C–F–G' : 'I–IV–V';
+      });
+      pill.querySelector('.loop-fold').addEventListener('click', function () {
+        const open = panel.classList.toggle('open');
+        this.classList.toggle('open', open);
+        this.textContent = open ? '▾' : '▸';
+        this.title = open ? 'Hide the form' : 'Show the form';
+      });
+
+      wrap.appendChild(pill);
+      wrap.appendChild(panel);
+      return wrap;
+    }
+
+    async function toggleLoopPill(pill) {
+      if (pill === _loopPill) { await stopLoopPill(); return; }
+      if (_loopPill) await stopLoopPill();
+
+      const chart = pill._chart, options = pill._options;
+      const body = {
+        chords: chart.slots.map(s => ({ symbol: s.symbol, beats: s.beats })),
+        tempo_bpm: options.tempo_bpm || chart.tempo_bpm,
+        time_signature: chart.time_signature,
+        feel: options.feel || chart.feel,
+        click: options.click !== false,
+        comp: options.comp !== false,
+        bass: options.bass !== false,
+        rootless: !!options.rootless,
+        count_in_bars: options.count_in_bars == null ? 1 : options.count_in_bars,
+        repeats: options.repeats == null ? null : options.repeats,
+        key: chart.key,
+      };
+      try {
+        const r = await fetch('/loop/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) return;
+      } catch (e) { return; }
+
+      // The side chart panel shares this transport, so hand the cursor over cleanly.
+      stopPolling();
+      clearCursor();
+
+      _loopPill = pill;
+      pill.classList.add('playing');
+      if (!_loopPillPoll) _loopPillPoll = setInterval(pollLoopPill, 90);
+    }
+
+    async function stopLoopPill() {
+      try { await fetch('/loop/stop', { method: 'POST' }); } catch (e) { /* ignore */ }
+      clearLoopPill();
+    }
+
+    function clearLoopPill() {
+      if (_loopPillPoll) clearInterval(_loopPillPoll);
+      _loopPillPoll = null;
+      const pill = _loopPill;
+      _loopPill = null;
+      if (!pill) return;
+      pill.classList.remove('playing');
+      pill._grid.querySelectorAll('.bar-cell.current').forEach(el => el.classList.remove('current'));
+      pill._grid.querySelectorAll('.slot.playing').forEach(el => el.classList.remove('playing'));
+      pill._grid.querySelectorAll('.beat-ticks').forEach(t => { t.innerHTML = ''; });
+    }
+
+    async function pollLoopPill() {
+      const pill = _loopPill;
+      if (!pill) { clearLoopPill(); return; }
+      let pos;
+      try { pos = await (await fetch('/loop/position')).json(); } catch (e) { return; }
+      // Covers both a `repeats` count running out and anything else stopping the transport.
+      if (!pos || !pos.playing) { clearLoopPill(); return; }
+      if (pos.count_in) return;
+
+      const grid = pill._grid, chart = pill._chart;
+      grid.querySelectorAll('.bar-cell.current').forEach(el => el.classList.remove('current'));
+      const cell = grid.querySelector(`.bar-cell[data-bar="${pos.bar}"]`);
+      if (cell) {
+        cell.classList.add('current');
+        const bpb = Math.max(1, Math.round(chart.slots.reduce((a, s) => a + s.beats, 0) / chart.bars));
+        cell.querySelector('.beat-ticks').innerHTML = Array.from({ length: bpb },
+          (_, i) => `<i class="${i < pos.beat ? 'on' : ''}"></i>`).join('');
+      }
+      grid.querySelectorAll('.beat-ticks').forEach(t => {
+        if (!t.closest('.bar-cell').classList.contains('current')) t.innerHTML = '';
+      });
+
+      // Match on the beat grid, not the chord symbol — symbols repeat across a form.
+      grid.querySelectorAll('.slot.playing').forEach(el => el.classList.remove('playing'));
+      const idx = chart.slots.findIndex(s =>
+        pos.position_beats >= s.start_beat && pos.position_beats < s.start_beat + s.beats);
+      if (idx >= 0) {
+        const el = grid.querySelector(`.slot[data-slot="${idx}"]`);
+        if (el) el.classList.add('playing');
+      }
+    }
+
+    // Streamed pills and pills restored from history both arrive as a bare host element
+    // carrying the chart JSON; hydrating on mutation keeps them on one code path.
+    function hydrateLoopPills(root) {
+      (root || document).querySelectorAll('.loop-pill-host').forEach(host => {
+        let data;
+        try { data = JSON.parse(host.dataset.loop || '{}'); } catch (e) { host.remove(); return; }
+        if (!data.chart) { host.remove(); return; }
+        host.replaceWith(buildLoopPill(data.chart, data.options));
+      });
+    }
+
+    new MutationObserver(() => hydrateLoopPills())
+      .observe(document.getElementById('transcript'), { childList: true, subtree: true });
 
     // ── Circle-of-fifths mastery grid ──
     const COF = ['C','G','D','A','E','B','F#','Db','Ab','Eb','Bb','F'];  // clockwise from top

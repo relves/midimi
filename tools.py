@@ -165,7 +165,34 @@ When the user wants something to **play over** — "give me a blues in F", "loop
 - Blues wants `feel: 'shuffle'` unless the user says straight.
 - Write ad-hoc charts in **roman numerals** (`slots: ['I', 'IV', 'V7']`), not chord symbols — numerals transpose exactly and give the user the roman-numeral overlay for free. Only use literal symbols when the harmony genuinely isn't diatonic to one key.
 - Use **show_chart** when they want to read the form rather than hear it. It returns both symbols and numerals, so you can answer "which bar is the IV?" without a second call.
-- Call **stop_loop** when they're done, or before starting something different."""
+- Call **stop_loop** when they're done, or before starting something different.
+
+### Loop any progression you're discussing
+
+`start_chart_loop` is not only for "play me a backing track". **Any time the conversation
+names a concrete progression, loop it** — an ad-hoc chart takes one call and turns an
+abstract answer into something the user can hear and play against:
+
+- They ask what a progression sounds like, or how two of them differ → loop it (then loop
+  the other), rather than describing it in prose.
+- You use a progression as an *example* while explaining a concept — secondary dominants,
+  a modal interchange, a turnaround, a cadence → loop the example.
+- They're working on a tune and you're talking about its changes → loop the section under
+  discussion so they can play over it while you talk.
+- They ask you to change something about what's playing (key, tempo, feel, mode, "make the
+  V a V7") → call `start_chart_loop` again with the new parameters. It replaces the
+  running loop; there's no need to `stop_loop` first.
+
+Sensible defaults for a discussion loop: 4–8 bars, `mode: 'as_written'`, a moderate tempo
+(around 90), and `repeats` omitted so it keeps going. Use short forms — loop the two bars
+that make the point, not a whole chorus.
+
+Every `start_chart_loop` call renders a **pill in the chat** showing the form bar by bar,
+with its own play/stop button and a live bar cursor. So:
+- Don't paste the chord grid back into your reply — the pill already shows it. Say what to
+  listen for instead ("notice the E7 pulling back to A in bar 4").
+- The pill stays in the transcript, so the user can restart that exact progression later.
+  This is another reason to prefer one loop per idea over one big loop you keep editing."""
 
 # ── Tool schemas ──────────────────────────────────────────────────────────────
 
@@ -704,7 +731,12 @@ TOOLS = [
             "with a count-in. This is the right tool for any 'play me a blues in F', 'give me a "
             "slow blues to solo over', 'loop a ii-V-I' request: the user practises *over* it, so "
             "it must keep going rather than play once. Never build a one-shot sequence for a "
-            "backing track. Returns the chart grid so you can tell the user what's coming."
+            "backing track. Also reach for it whenever the conversation names a concrete "
+            "progression — an example you're explaining, two progressions you're comparing, the "
+            "changes of a tune you're discussing — so the user can hear and play against what "
+            "you're describing. Renders a pill in the chat with the form, a live bar cursor and "
+            "its own play/stop, so don't repeat the grid in your reply. Calling it again "
+            "replaces the running loop; no need to stop_loop first."
         ),
         "input_schema": {
             "type": "object",
@@ -979,6 +1011,7 @@ def dispatch_tools(
     resolve_sequence,          # callable(seq_id) -> dict | None
     sequence_pill_fn,          # callable(seq_id, title, pill_id, duration_ms, midi_url, sequence_dict) -> str
     audio_pill_fn,             # callable(note_id, label, pill_id, notes, root, quality) -> str
+    loop_pill_fn,              # callable(rendered_chart, options) -> str
     generated_dir: Path,
     play_notes_bg,             # callable(notes, duration_ms, note_id)
 ) -> Iterator[tuple[str, object]]:
@@ -1580,9 +1613,24 @@ def dispatch_tools(
                 yield _err(f"Could not start the loop: {e}")
                 continue
 
+            options = {
+                "tempo_bpm": config.tempo_bpm,
+                "feel": config.feel,
+                "click": config.click,
+                "comp": config.comp,
+                "bass": config.bass,
+                "rootless": config.rootless,
+                "count_in_bars": config.count_in_bars,
+                "repeats": config.repeats,
+            }
+            yield ("sse", loop_pill_fn(rendered, options))
+            yield ("record", {"type": "loop", "chart": rendered, "options": options})
+
             tail = "looping until stopped" if config.repeats is None else f"{config.repeats}x through"
             yield _ok(
-                f"Loop running — {config.tempo_bpm:g} bpm, {config.feel} feel, {tail}.\n\n{grid}"
+                f"Loop running — {config.tempo_bpm:g} bpm, {config.feel} feel, {tail}. "
+                f"A pill in the chat shows the form and replays or stops it, so don't "
+                f"repeat the grid back in your reply — just say what to listen for.\n\n{grid}"
             )
 
         elif name == "stop_loop":

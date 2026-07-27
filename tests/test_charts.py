@@ -305,3 +305,43 @@ def test_chart_text_can_show_the_roman_overlay():
     rendered = render_chart(get_chart("blues-12-bar"), key="C", mode="dominant7")
     assert "C7(I7)" in chart_text(rendered, roman=True)
     assert "C7(I7)" not in chart_text(rendered, roman=False)
+
+
+# ── Chat pill ─────────────────────────────────────────────────────────────────
+
+def test_start_chart_loop_emits_a_pill_and_a_restorable_record(tmp_path):
+    """The pill carries the whole rendered chart, so the client can redraw the form and
+    restart the loop from history without re-resolving the chart id."""
+    import json
+
+    import sequencer.engine as engine
+    import sequencer.loop as loop
+    import tools as tools_mod
+
+    engine.set_note_fns(lambda *a, **k: None, lambda *a, **k: None, lambda *a, **k: None, None)
+    try:
+        out = list(tools_mod.dispatch_tools(
+            [{"name": "start_chart_loop", "id": "t1",
+              "input": {"chart_id": "blues-12-bar", "key": "F", "mode": "dominant7",
+                        "tempo_bpm": 80, "click": False}}],
+            session_id="s1", asst_msg_id="a", note_registry={}, sequence_registry={},
+            resolve_sequence=lambda i: None, sequence_pill_fn=None, audio_pill_fn=None,
+            loop_pill_fn=lambda chart, options: json.dumps({"chart": chart, "options": options}),
+            generated_dir=tmp_path, play_notes_bg=None,
+        ))
+    finally:
+        loop.stop()
+
+    pill = json.loads(next(p for k, p in out if k == "sse"))
+    assert pill["chart"]["key"] == "F"
+    assert pill["chart"]["bars"] == 12
+    assert pill["chart"]["slots"][0]["symbol"] == "F7"
+    assert pill["options"]["tempo_bpm"] == 80
+    assert pill["options"]["repeats"] is None
+
+    record = next(p for k, p in out if k == "record")
+    assert record["type"] == "loop"
+    assert record["chart"]["slots"] == pill["chart"]["slots"]
+
+    result = next(p for k, p in out if k == "result")
+    assert not result.get("is_error"), result["content"]

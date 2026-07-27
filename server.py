@@ -535,6 +535,18 @@ def sequence_pill(sequence_id: str, title: str, pill_id: str, duration_ms: int, 
     )
 
 
+def loop_pill(rendered: dict, options: dict) -> str:
+    """A placeholder the client hydrates into a loop pill.
+
+    The pill needs live transport state (play/stop, bar cursor), so the markup is built
+    in JS rather than here — emitting one host element keeps the streamed and the
+    restored-from-history paths on a single implementation instead of two that drift.
+    """
+    import json as _json
+    payload = _json.dumps({"chart": rendered, "options": options})
+    return f'<div class="loop-pill-host" data-loop="{html.escape(payload, quote=True)}"></div>'
+
+
 # ── Config routes ─────────────────────────────────────────────────────────────
 
 class ConfigRequest(BaseModel):
@@ -1947,6 +1959,7 @@ def chat_stream(req: ChatRequest):
                 resolve_sequence=_resolve_sequence,
                 sequence_pill_fn=sequence_pill,
                 audio_pill_fn=audio_pill,
+                loop_pill_fn=loop_pill,
                 generated_dir=GENERATED_DIR,
                 play_notes_bg=play_in_background,
             ):

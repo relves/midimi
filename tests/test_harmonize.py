@@ -34,7 +34,8 @@ def _dispatch(tools, calls, tmp_path):
     return list(tools.dispatch_tools(
         calls, session_id="s1", asst_msg_id="a", note_registry={}, sequence_registry={},
         resolve_sequence=lambda i: None, sequence_pill_fn=lambda *a: "<pill>",
-        audio_pill_fn=None, generated_dir=tmp_path, play_notes_bg=None,
+        audio_pill_fn=None, loop_pill_fn=lambda *a: "<loop-pill>",
+        generated_dir=tmp_path, play_notes_bg=None,
     ))
 
 
