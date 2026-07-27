@@ -1416,6 +1416,35 @@ def per_bar_report(sequence: dict) -> list[str]:
     return messages
 
 
+def chord_report(sequence: dict) -> list[str]:
+    """Name every written chord (3+ simultaneous notes) so the agent can verify it.
+
+    Hand-written ABC accidentals are the easiest place to get a chord wrong —
+    e.g. `[A,^CE^G]` in K:A is Amaj7, not the A7 the author meant. Echoing the
+    identified chord name back makes that mistake visible before it is played.
+    """
+    from sequencer.theory import identify_chord
+
+    ts_num, ts_den = sequence['time_signature_parts']
+    beats_per_bar = ts_num * 4 / ts_den
+
+    lines: list[str] = []
+    voices = {v['id']: v.get('name', v['id']) for v in (sequence.get('voices') or [])}
+
+    for e in sorted(sequence.get('events', []), key=lambda x: (x['at_beat'], x.get('voice') or '')):
+        names = e.get('note_names') or []
+        if len(names) < 3:
+            continue
+        name = identify_chord(names)
+        if not name:
+            continue
+        bar = int(e['at_beat'] / beats_per_bar) + 1
+        beat = e['at_beat'] % beats_per_bar + 1
+        prefix = f"voice {voices[e['voice']]}, " if e.get('voice') in voices else ""
+        lines.append(f"  {prefix}bar {bar} beat {beat:.4g}: {' '.join(names)} = {name}")
+    return lines
+
+
 def _per_bar_report_single(sequence: dict, events: list[dict]) -> list[str]:
     """Per-bar beat accounting for a single set of events."""
     ts_num, ts_den = sequence['time_signature_parts']

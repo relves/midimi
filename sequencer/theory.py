@@ -14,7 +14,7 @@ import re
 from functools import lru_cache
 
 # music21 is a heavy import; keep it isolated here.
-from music21 import harmony, pitch as m21pitch, interval as m21interval, scale as m21scale
+from music21 import harmony, pitch as m21pitch, interval as m21interval, scale as m21scale, chord as m21chord
 
 # ── Canonical interval table (same as server.py) ─────────────────────────────
 # This is the source of truth for which qualities exist and their intervals.
@@ -421,6 +421,39 @@ def _midi_to_name(midi: int, prefer_flats: bool = False) -> str:
 def midi_note_name(n: int, prefer_flats: bool = False) -> str:
     """Public alias for _midi_to_name."""
     return _midi_to_name(n, prefer_flats)
+
+
+@lru_cache(maxsize=512)
+def _identify_chord_cached(names: tuple[str, ...]) -> str | None:
+    try:
+        c = m21chord.Chord([_to_m21_pitch_name(n) for n in names])
+        return c.pitchedCommonName or None
+    except Exception:
+        return None
+
+
+def _to_m21_pitch_name(name: str) -> str:
+    """'Bb4' -> 'B-4', 'F#3' -> 'F#3', 'Ebb4' -> 'E--4'. music21 spells flats '-'."""
+    letter, rest = name[0], name[1:]
+    acc = ''
+    while rest and rest[0] in '#b-':
+        acc += '-' if rest[0] == 'b' else rest[0]
+        rest = rest[1:]
+    return f"{letter}{acc}{rest}"
+
+
+def identify_chord(note_names: list[str]) -> str | None:
+    """Name a simultaneity from its spelled pitch names.
+
+    e.g. ['A3','C#4','E4','G#4'] -> 'A-major seventh chord'
+         ['A3','C#4','E4','G4']  -> 'A-dominant seventh chord'
+
+    Returns None when the notes can't be named (or on any music21 failure) —
+    this is a reporting aid, never a hard error.
+    """
+    if not note_names:
+        return None
+    return _identify_chord_cached(tuple(note_names))
 
 
 def key_prefers_flats(key: str | None) -> bool | None:

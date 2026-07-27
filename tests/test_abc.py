@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import pytest
 import mido
 from fractions import Fraction
-from sequencer.abc import parse_abc, to_abc, ABCParseError, per_bar_report
+from sequencer.abc import parse_abc, to_abc, ABCParseError, per_bar_report, chord_report
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -345,3 +345,43 @@ class TestToAbc:
         out = to_abc(seq)
         seq2 = parse_abc(out)
         assert len(seq2["events"]) == 6
+
+
+class TestChordReport:
+    """chord_report names what was actually notated, catching accidental typos."""
+
+    HEAD = "X:1\nT:t\nM:4/4\nL:1/4\nQ:96\nK:A\n"
+
+    def test_sharp_g_in_key_of_a_reads_as_maj7(self):
+        """The original failure: ^G in K:A gives Amaj7, not A7."""
+        seq = parse_abc(self.HEAD + "[A,^CE^G]4 |")
+        rows = chord_report(seq)
+        assert len(rows) == 1
+        assert "A-major seventh chord" in rows[0]
+        assert "bar 1 beat 1" in rows[0]
+
+    def test_natural_g_reads_as_dominant7(self):
+        seq = parse_abc(self.HEAD + "[A,^CE=G]4 |")
+        assert "A-dominant seventh chord" in chord_report(seq)[0]
+
+    def test_flat_spelling(self):
+        seq = parse_abc("X:1\nT:t\nM:4/4\nL:1/4\nQ:96\nK:F\n[_B,DF_A]4 |")
+        assert "Bb-dominant seventh chord" in chord_report(seq)[0]
+
+    def test_dyads_and_single_notes_are_not_reported(self):
+        seq = parse_abc(self.HEAD + "[CE]2 [CE]2 | A4 |")
+        assert chord_report(seq) == []
+
+    def test_bar_and_beat_positions(self):
+        seq = parse_abc(self.HEAD + "[A,^CE]2 [D,^FA]2 |")
+        rows = chord_report(seq)
+        assert "bar 1 beat 1" in rows[0]
+        assert "bar 1 beat 3" in rows[1]
+
+    def test_multi_voice_labels_the_voice(self):
+        abc = ("X:1\nT:t\nM:4/4\nL:1/4\nQ:96\nK:C\nV:1\nV:2\n"
+               "[V:1] c4 |\n[V:2] [CEG]4 |\n")
+        rows = chord_report(parse_abc(abc))
+        assert len(rows) == 1
+        assert "voice 2" in rows[0]
+        assert "C-major triad" in rows[0]

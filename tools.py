@@ -14,7 +14,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterator
 
-from sequencer.abc import parse_abc, to_abc, ABCParseError, per_bar_report
+from sequencer.abc import parse_abc, to_abc, ABCParseError, per_bar_report, chord_report
 from sequencer.theory import normalize_chord_quality, chord_note_names, build_chord, parse_pitch, midi_note_name, voice_chord as _voice_chord, voice_progression as _voice_progression
 from sequencer.midi_io import write_sequence_midi
 import sequencer.model as seq_model
@@ -44,8 +44,15 @@ SYSTEM_PROMPT = """You are an expert music theory teacher. You explain concepts 
 ## Playback tools
 
 - Use **play_notes** for one isolated chord, interval, or single note.
-- Use **play_abc** for any melody, progression, or rhythmic example longer than a single chord. This is the primary tool for one-shot playback — it accepts ABC notation and gives you per-bar feedback.
-- Use **check_abc** to validate ABC before playing when correctness is critical (e.g. anything more than a couple of bars, or when meter or rhythm matters). Read the normalized ABC and per-bar report in the result, fix any errors, then call play_abc.
+- Use **play_sequence** for chord progressions — anything you would describe by chord name (ii-V-I, a secondary dominant, a cadence, a turnaround). Give each event a `root` and a `quality` ("A" + "dominant7") and the server computes the correct notes.
+- Use **play_abc** for melody, rhythm, voice leading, and multi-voice arrangement — music where the *lines* are the point, not the chord labels.
+- Use **check_abc** to validate ABC before playing when correctness is critical (e.g. anything more than a couple of bars, or when meter or rhythm matters). Read the normalized ABC, per-bar report, and "Chords as written" block in the result, fix any errors, then call play_abc.
+
+**Never hand-spell chord tones in ABC when a chord name would do.** Writing `[A,^CE^G]` for "A7" is exactly the mistake this rule exists to prevent: in `K:A` the key signature already sharpens G, so `^G` gives G♯ and the chord sounds as Amaj7, not A7 — you would need `=G` for the natural. `play_sequence` with `{root: "A", quality: "dominant7"}` cannot be typo'd that way, because you never write an accidental at all.
+
+When you *do* write chords in ABC (because the piece needs voice leading or multiple voices):
+- Build the voicing with **voice_chord** / **voice_progression** rather than by hand, and
+- After check_abc, read the **"Chords as written"** block back. It names every chord you actually notated. If it says "A-major seventh chord" where you meant A7, fix the accidental before playing — that block is your ground truth, not your intent.
 - If the user includes an image of sheet music, transcribe it to ABC notation, run check_abc, then play_abc.
 
 ## Persistent sequences (for multi-turn composition)
@@ -179,7 +186,7 @@ TOOLS = [
     },
     {
         "name": "play_abc",
-        "description": "Parse ABC notation, save it, and play it back. Returns normalized ABC and a per-bar report so you can verify what was actually stored. Use check_abc first for complex pieces.",
+        "description": "Parse ABC notation, save it, and play it back. Returns normalized ABC, a per-bar report, and a 'Chords as written' block naming every chord you notated, so you can verify what was actually stored. Use check_abc first for complex pieces. For a plain chord progression prefer play_sequence — hand-writing accidentals in ABC is error-prone.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -284,7 +291,7 @@ TOOLS = [
     },
     {
         "name": "play_sequence",
-        "description": "Create, save, and play a short timed MIDI orchestration. Use this for chord progressions or note/chord sequences where timing matters.",
+        "description": "Create, save, and play a chord progression or timed note/chord sequence. Preferred over play_abc whenever the chords are the point: you give root + quality by name ('A' + 'dominant7') and the server computes the exact notes, so you can't mis-spell an accidental. Use play_abc instead only for melody, voice leading, or multi-voice writing.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -887,6 +894,14 @@ def build_melody(tool_input: dict) -> dict:
     return sequence
 
 
+def _chord_report_lines(sequence: dict) -> list[str]:
+    """Report block naming every chord written in the ABC, or [] if there are none."""
+    rows = chord_report(sequence)
+    if not rows:
+        return []
+    return ["", "Chords as written (verify these match the chords you intended):"] + rows
+
+
 def _sequence_warnings(sequence: dict, *, melody: bool = False) -> list[str]:
     warnings = []
     events = sequence["events"]
@@ -998,6 +1013,7 @@ def dispatch_tools(
                 "", "Per-bar report:",
             ]
             lines += (bar_msgs if bar_msgs else ["  All bars correct."])
+            lines += _chord_report_lines(sequence)
             lines += ["", "Normalized ABC:", normalized]
             yield _ok("\n".join(lines))
 
@@ -1032,6 +1048,7 @@ def dispatch_tools(
                 "", "Per-bar report:",
             ]
             lines += (bar_msgs if bar_msgs else ["  All bars correct."])
+            lines += _chord_report_lines(sequence)
             lines += ["", "Normalized ABC (what was stored):", normalized]
             yield _ok("\n".join(lines))
 
@@ -1156,6 +1173,7 @@ def dispatch_tools(
                 lines += ["", f"Notes: {dropped}"]
             lines += ["", "Per-bar report:"]
             lines += (bar_msgs if bar_msgs else ["  All bars correct."])
+            lines += _chord_report_lines(sequence)
             lines += ["", "Normalized ABC:", normalized]
             yield _ok("\n".join(lines))
 
@@ -1180,6 +1198,7 @@ def dispatch_tools(
                 "", "Per-bar report:",
             ]
             lines += (bar_msgs if bar_msgs else ["  All bars correct."])
+            lines += _chord_report_lines(sequence)
             lines += ["", "Normalized ABC:", normalized]
             yield _ok("\n".join(lines))
 
@@ -1294,6 +1313,7 @@ def dispatch_tools(
                     bar_msgs = per_bar_report(sequence)
                     lines = [f"Updated sequence '{seq_id}' (bar edits applied).", "", "Per-bar report:"]
                     lines += (bar_msgs if bar_msgs else ["  All bars correct."])
+                    lines += _chord_report_lines(sequence)
                     lines += ["", "Normalized ABC (stored):", normalized]
                     yield _ok("\n".join(lines))
                     continue
@@ -1314,6 +1334,7 @@ def dispatch_tools(
                 "", "Per-bar report:",
             ]
             lines += (bar_msgs if bar_msgs else ["  All bars correct."])
+            lines += _chord_report_lines(sequence)
             lines += ["", "Normalized ABC (stored):", normalized]
             yield _ok("\n".join(lines))
 
