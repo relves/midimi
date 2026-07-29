@@ -14,8 +14,8 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterator
 
-from sequencer.abc import parse_abc, to_abc, ABCParseError, per_bar_report, chord_report
-from sequencer.theory import normalize_chord_quality, chord_note_names, build_chord, parse_pitch, midi_note_name, voice_chord as _voice_chord, voice_progression as _voice_progression
+from sequencer.abc import parse_abc, to_abc, ABCParseError, per_bar_report, chord_report, unnamed_chords
+from sequencer.theory import normalize_chord_quality, chord_note_names, build_chord, parse_pitch, midi_note_name, chord_abc_token, voice_chord as _voice_chord, voice_progression as _voice_progression
 from sequencer.midi_io import write_sequence_midi
 import sequencer.model as seq_model
 import sequencer.engine as engine
@@ -48,11 +48,14 @@ SYSTEM_PROMPT = """You are an expert music theory teacher. You explain concepts 
 - Use **play_abc** for melody, rhythm, voice leading, and multi-voice arrangement — music where the *lines* are the point, not the chord labels.
 - Use **check_abc** to validate ABC before playing when correctness is critical (e.g. anything more than a couple of bars, or when meter or rhythm matters). Read the normalized ABC, per-bar report, and "Chords as written" block in the result, fix any errors, then call play_abc.
 
-**Never hand-spell chord tones in ABC when a chord name would do.** Writing `[A,^CE^G]` for "A7" is exactly the mistake this rule exists to prevent: in `K:A` the key signature already sharpens G, so `^G` gives G♯ and the chord sounds as Amaj7, not A7 — you would need `=G` for the natural. `play_sequence` with `{root: "A", quality: "dominant7"}` cannot be typo'd that way, because you never write an accidental at all.
+**Never type `^`, `_` or `=` inside a `[...]` chord in ABC.** If you are about to, stop and use a different tool. Writing `[A,^CE^G]` for "A7" is exactly the mistake this rule exists to prevent: in `K:A` the key signature already sharpens G, so `^G` gives G♯ and the chord sounds as Amaj7, not A7 — you would need `=G` for the natural. `play_sequence` with `{root: "A", quality: "dominant7"}` cannot be typo'd that way, because you never write an accidental at all.
+
+- One chord, or two chords compared back to back? That is **play_notes** / **play_sequence**, never ABC. Reaching for ABC out of habit here is how the accidental bug happens.
+- Need the chord *inside* an ABC line anyway? Call **chord_in_abc** and paste the token it returns. It spells every note explicitly, so it is correct under any `K:` header.
 
 When you *do* write chords in ABC (because the piece needs voice leading or multiple voices):
 - Build the voicing with **voice_chord** / **voice_progression** rather than by hand, and
-- After check_abc, read the **"Chords as written"** block back. It names every chord you actually notated. If it says "A-major seventh chord" where you meant A7, fix the accidental before playing — that block is your ground truth, not your intent.
+- After check_abc, read the **"Chords as written"** block back. It names every chord you actually notated. If it says "A major7" where you meant A7, fix the accidental before playing — that block is your ground truth, not your intent. `play_abc` refuses outright when a written chord is not a nameable chord at all.
 - If the user includes an image of sheet music, transcribe it to ABC notation, run check_abc, then play_abc.
 
 ## Persistent sequences (for multi-turn composition)
@@ -213,7 +216,7 @@ TOOLS = [
     },
     {
         "name": "play_abc",
-        "description": "Parse ABC notation, save it, and play it back. Returns normalized ABC, a per-bar report, and a 'Chords as written' block naming every chord you notated, so you can verify what was actually stored. Use check_abc first for complex pieces. For a plain chord progression prefer play_sequence — hand-writing accidentals in ABC is error-prone.",
+        "description": "Parse ABC notation, save it, and play it back. Returns normalized ABC, a per-bar report, and a 'Chords as written' block naming every chord you notated, so you can verify what was actually stored. Refuses to play when a written chord is not a nameable chord — that means an accidental collided with the key signature. Use check_abc first for complex pieces. For a plain chord progression prefer play_sequence — hand-writing accidentals in ABC is error-prone.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -221,8 +224,35 @@ TOOLS = [
                     "type": "string",
                     "description": "Full ABC notation string including headers (X:, T:, M:, L:, Q:, K:) and body.",
                 },
+                "allow_unusual_chords": {
+                    "type": "boolean",
+                    "description": "Play even if a written chord matches no standard quality. Only set this when the dissonance is deliberate (a cluster, a tone row) — not to push past a suspected typo.",
+                    "default": False,
+                },
             },
             "required": ["abc"],
+        },
+    },
+    {
+        "name": "chord_in_abc",
+        "description": (
+            "Spell a chord as a ready-to-paste ABC chord token, e.g. Dmaj7 -> '[=D^F=A^c]'. "
+            "Every note carries an explicit accidental, so the token is correct under any K: header "
+            "and regardless of accidentals earlier in the bar. Use this instead of hand-writing "
+            "'^' or '_' inside '[...]'. For voice-led inner parts use voice_chord instead."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "root": {"type": "string", "description": "Root note, e.g. 'C', 'F#', 'Bb'."},
+                "quality": {"type": "string", "description": "Chord quality, e.g. 'major7', 'dominant7', 'minor7'."},
+                "octave": {
+                    "type": "integer",
+                    "description": "Octave of the root; 4 is the octave starting at middle C. Default 4.",
+                    "default": 4,
+                },
+            },
+            "required": ["root", "quality"],
         },
     },
     {
@@ -931,7 +961,15 @@ def _chord_report_lines(sequence: dict) -> list[str]:
     rows = chord_report(sequence)
     if not rows:
         return []
-    return ["", "Chords as written (verify these match the chords you intended):"] + rows
+    lines = ["", "Chords as written (verify these match the chords you intended):"] + rows
+    if any(row.lstrip().startswith("!!") for row in rows):
+        lines += [
+            "",
+            "The !! chords above are not chords anyone would name — treat them as a "
+            "spelling bug, not a result. Re-spell them with chord_in_abc (or drop to "
+            "play_sequence) before showing this to the user; play_abc will refuse them.",
+        ]
+    return lines
 
 
 def _sequence_warnings(sequence: dict, *, melody: bool = False) -> list[str]:
@@ -1056,6 +1094,16 @@ def dispatch_tools(
             except ABCParseError as e:
                 yield _err(f"ABC parse error:\n{e}")
                 continue
+            suspect = unnamed_chords(sequence)
+            if suspect and not inp.get("allow_unusual_chords"):
+                yield _err("\n".join([
+                    "Refusing to play: the ABC contains chords that are not standard chords.",
+                    *suspect,
+                    "",
+                    "Fix the spelling (chord_in_abc gives a token that is safe in any key), "
+                    "or pass allow_unusual_chords: true if the sound is deliberate.",
+                ]))
+                continue
             normalized = to_abc(sequence)
             seq_id = seq_model.create_sequence(
                 title=sequence["title"], abc=normalized, session_id=session_id,
@@ -1084,6 +1132,20 @@ def dispatch_tools(
             lines += _chord_report_lines(sequence)
             lines += ["", "Normalized ABC (what was stored):", normalized]
             yield _ok("\n".join(lines))
+
+        elif name == "chord_in_abc":
+            try:
+                spelled = chord_abc_token(inp["root"], inp["quality"], int(inp.get("octave", 4)))
+            except ValueError as e:
+                yield _err(str(e))
+                continue
+            yield _ok("\n".join([
+                f"{inp['root']} {spelled['quality']}: {spelled['abc_token']}",
+                f"Notes: {' '.join(spelled['note_names'])}",
+                "Paste the token as-is; it needs no adjustment for the key signature. "
+                "Add a duration after it if the chord is not one unit long, e.g. "
+                f"{spelled['abc_token']}4",
+            ]))
 
         elif name == "play_notes":
             duration_ms = inp.get("duration_ms", DEFAULT_DURATION_MS)

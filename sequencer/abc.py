@@ -1423,26 +1423,57 @@ def chord_report(sequence: dict) -> list[str]:
     e.g. `[A,^CE^G]` in K:A is Amaj7, not the A7 the author meant. Echoing the
     identified chord name back makes that mistake visible before it is played.
     """
-    from sequencer.theory import identify_chord
+    return [line for line, _matched in _chord_rows(sequence)]
+
+
+def unnamed_chords(sequence: dict) -> list[str]:
+    """The subset of `chord_report` rows whose notes are not a nameable chord.
+
+    A non-empty result almost always means a hand-written accidental fought the
+    key signature (or a `^`/`_` earlier in the same bar) and produced a chord
+    nobody meant. Callers treat this as a hard stop rather than a warning,
+    because the old behaviour — play the mess, mention it afterwards — is
+    exactly how the mistake reached the listener.
+    """
+    return [line for line, matched in _chord_rows(sequence) if not matched]
+
+
+def _chord_rows(sequence: dict) -> list[tuple[str, bool]]:
+    """(report line, is-a-nameable-chord) for every 3+ note simultaneity."""
+    from sequencer.theory import identify_chord, match_chord_quality
 
     ts_num, ts_den = sequence['time_signature_parts']
     beats_per_bar = ts_num * 4 / ts_den
+    key = sequence.get('key', 'C')
 
-    lines: list[str] = []
+    rows: list[tuple[str, bool]] = []
     voices = {v['id']: v.get('name', v['id']) for v in (sequence.get('voices') or [])}
 
     for e in sorted(sequence.get('events', []), key=lambda x: (x['at_beat'], x.get('voice') or '')):
         names = e.get('note_names') or []
         if len(names) < 3:
             continue
-        name = identify_chord(names)
-        if not name:
-            continue
         bar = int(e['at_beat'] / beats_per_bar) + 1
         beat = e['at_beat'] % beats_per_bar + 1
         prefix = f"voice {voices[e['voice']]}, " if e.get('voice') in voices else ""
-        lines.append(f"  {prefix}bar {bar} beat {beat:.4g}: {' '.join(names)} = {name}")
-    return lines
+        where = f"{prefix}bar {bar} beat {beat:.4g}: {' '.join(names)}"
+
+        quality = match_chord_quality(names)
+        if quality:
+            m21 = identify_chord(names)
+            detail = f"{quality} ({m21})" if m21 else quality
+            rows.append((f"  {where} = {detail}", True))
+            continue
+
+        m21 = identify_chord(names)
+        aside = f' — music21 calls it "{m21}"' if m21 else ""
+        rows.append((
+            f"  !! {where} = not a standard chord{aside}. "
+            f"An accidental here probably collided with K:{key} or with an earlier "
+            f"accidental in the same bar; use chord_in_abc to spell the chord you meant.",
+            False,
+        ))
+    return rows
 
 
 def _per_bar_report_single(sequence: dict, events: list[dict]) -> list[str]:

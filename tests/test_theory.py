@@ -11,8 +11,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import pytest
 from sequencer.theory import (
     build_chord, chord_note_names, normalize_chord_quality, parse_pitch, CHORD_INTERVALS,
-    _parse_chord_symbol_to_root_quality,
+    _parse_chord_symbol_to_root_quality, match_chord_quality, chord_abc_token,
 )
+from sequencer.abc import parse_abc
 
 GOLDEN_PATH = os.path.join(os.path.dirname(__file__), "golden_theory.json")
 
@@ -208,3 +209,58 @@ class TestBuildChord:
     def test_unknown_quality_raises(self):
         with pytest.raises(ValueError):
             build_chord("C", "notaquality", 4)
+
+
+class TestMatchChordQuality:
+    """Strict pitch-class matching against the qualities this tool can build."""
+
+    def test_every_buildable_chord_matches_itself(self):
+        for quality in CHORD_INTERVALS:
+            if len(CHORD_INTERVALS[quality]) < 3:
+                continue  # notes/intervals are not chords
+            names = chord_note_names('C', quality, 4)
+            assert match_chord_quality(names) is not None, f"{quality} {names}"
+
+    def test_returns_root_and_quality(self):
+        assert match_chord_quality(['D4', 'F#4', 'A4', 'C#5']) == 'D major7'
+
+    def test_inversion_names_the_root_not_the_bass(self):
+        assert match_chord_quality(['E4', 'G4', 'C5']) == 'C major'
+
+    def test_mis_spelled_chord_matches_nothing(self):
+        """The reported failure: D C# E G# is not a chord anyone would name."""
+        assert match_chord_quality(['D3', 'C#4', 'E4', 'G#4']) is None
+
+    def test_dyads_are_not_chords(self):
+        assert match_chord_quality(['C4', 'G4']) is None
+
+    def test_unknown_note_name_is_not_a_chord(self):
+        assert match_chord_quality(['C4', 'H4', 'G4']) is None
+
+
+class TestChordAbcToken:
+    """chord_in_abc's spelling must survive any key signature."""
+
+    def test_token_shape(self):
+        out = chord_abc_token('D', 'major7')
+        assert out['abc_token'] == '[=D^F=A^c]'
+        assert out['note_names'] == ['D4', 'F#4', 'A4', 'C#5']
+
+    def test_every_note_carries_an_explicit_accidental(self):
+        token = chord_abc_token('Bb', 'dominant7', 3)['abc_token']
+        assert token == '[_B,=D=F_A]'
+
+    def test_token_parses_to_the_same_chord_in_any_key(self):
+        for key in ('C', 'D', 'F', 'Bb', 'F#'):
+            token = chord_abc_token('D', 'major7')['abc_token']
+            seq = parse_abc(f"X:1\nT:t\nM:4/4\nL:1/4\nQ:96\nK:{key}\n{token}4 |")
+            assert seq['events'][0]['notes'] == [62, 66, 69, 73], key
+
+    def test_token_survives_an_earlier_accidental_in_the_bar(self):
+        token = chord_abc_token('D', 'major7')['abc_token']
+        seq = parse_abc(f"X:1\nT:t\nM:4/4\nL:1/4\nQ:96\nK:C\n^F ^c =A ^D | {token}4 |")
+        assert seq['events'][4]['notes'] == [62, 66, 69, 73]
+
+    def test_unknown_root_raises(self):
+        with pytest.raises(ValueError):
+            chord_abc_token('H', 'major7')

@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import pytest
 import mido
 from fractions import Fraction
-from sequencer.abc import parse_abc, to_abc, ABCParseError, per_bar_report, chord_report
+from sequencer.abc import parse_abc, to_abc, ABCParseError, per_bar_report, chord_report, unnamed_chords
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -385,3 +385,34 @@ class TestChordReport:
         assert len(rows) == 1
         assert "voice 2" in rows[0]
         assert "C-major triad" in rows[0]
+
+    def test_named_row_leads_with_the_playable_quality(self):
+        seq = parse_abc(self.HEAD + "[A,^CE^G]4 |")
+        assert "= A major7" in chord_report(seq)[0]
+
+
+class TestUnnamedChords:
+    """Chords that match no standard quality are flagged, not silently played."""
+
+    def test_frankenchord_is_flagged(self):
+        """The reported failure: [D,^CE^G] in K:D is not any chord at all."""
+        seq = parse_abc("X:1\nT:t\nM:4/4\nL:1/4\nQ:96\nK:D\n[D,^CE^G]4 |")
+        rows = unnamed_chords(seq)
+        assert len(rows) == 1
+        assert "not a standard chord" in rows[0]
+        assert "K:D" in rows[0]
+        assert "bar 1 beat 1" in rows[0]
+
+    def test_correctly_spelled_chord_is_not_flagged(self):
+        seq = parse_abc("X:1\nT:t\nM:4/4\nL:1/4\nQ:96\nK:D\n[D,FA^c]4 |")
+        assert unnamed_chords(seq) == []
+        assert "D major7" in chord_report(seq)[0]
+
+    def test_inversions_and_extensions_are_not_flagged(self):
+        head = "X:1\nT:t\nM:4/4\nL:1/4\nQ:96\nK:C\n"
+        for body in ("[EGc]4 |", "[CEGA]4 |", "[CFG]4 |", "[CEGBd]4 |"):
+            assert unnamed_chords(parse_abc(head + body)) == [], body
+
+    def test_dyads_are_never_flagged(self):
+        seq = parse_abc("X:1\nT:t\nM:4/4\nL:1/4\nQ:96\nK:C\n[C^F]4 |")
+        assert unnamed_chords(seq) == []

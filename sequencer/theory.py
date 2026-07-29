@@ -456,6 +456,96 @@ def identify_chord(note_names: list[str]) -> str | None:
     return _identify_chord_cached(tuple(note_names))
 
 
+# Preference order when a pitch-class set matches more than one quality — plain
+# triads and sevenths win over the exotic readings of the same set (e.g.
+# {C E G A} is both major6 and minor7/A; the bass note breaks that tie first,
+# and this list breaks what the bass leaves).
+_QUALITY_PREFERENCE = [
+    "major", "minor", "diminished", "augmented", "sus2", "sus4",
+    "major7", "dominant7", "minor7", "minormajor7", "halfdiminished7",
+    "diminished7", "augmented7", "major6", "minor6", "add9",
+    "dominant7sus4", "dominant7#5", "major9", "dominant9", "minor9",
+    "dominant7b9", "dominant7#9", "major69", "major7#11",
+    "dominant11", "minor11", "dominant13", "dominant7b13", "dominant7alt",
+]
+
+
+def match_chord_quality(note_names: list[str]) -> str | None:
+    """Name a simultaneity as one of the qualities this tool can build, or None.
+
+    Unlike `identify_chord` (music21) this is a strict pitch-class-set match
+    against CHORD_INTERVALS, so it answers a different question: "is this a
+    chord a musician would name?" rather than "what set-theory label fits?".
+    music21 cheerfully names anything — a mis-spelled `[D,^CE^G]` comes back as
+    "C#-all-interval tetrachord" — which is why it cannot be used to catch the
+    hand-spelled-accidental mistakes this guard exists for.
+
+    Returns e.g. "D major7", or None when nothing matches. Inversions match
+    (the set is unordered), so the returned root is the chord root, not the bass.
+    """
+    pcs = set()
+    for name in note_names:
+        pc = NOTE_NAMES.get(name.rstrip("-0123456789"))
+        if pc is None:
+            return None
+        pcs.add(pc)
+    if len(pcs) < 3:
+        return None
+
+    bass_pc = NOTE_NAMES.get(note_names[0].rstrip("-0123456789"))
+    # Spell the root from the written note of that pitch class where possible.
+    spelling = {}
+    for name in note_names:
+        letters = name.rstrip("-0123456789")
+        spelling.setdefault(NOTE_NAMES[letters], letters)
+
+    best = None  # (bass_penalty, preference_rank, root_pc, quality)
+    for quality in _QUALITY_PREFERENCE:
+        intervals = CHORD_INTERVALS[quality]
+        if len(set(i % 12 for i in intervals)) != len(pcs):
+            continue
+        for root_pc in range(12):
+            if {(root_pc + i) % 12 for i in intervals} != pcs:
+                continue
+            candidate = (
+                0 if root_pc == bass_pc else 1,
+                _QUALITY_PREFERENCE.index(quality),
+                root_pc,
+                quality,
+            )
+            if best is None or candidate < best:
+                best = candidate
+    if best is None:
+        return None
+    _, _, root_pc, quality = best
+    return f"{spelling.get(root_pc, _midi_to_name(60 + root_pc))} {quality}"
+
+
+def chord_abc_token(root: str, quality: str, octave: int = 4) -> dict:
+    """Spell a chord as a self-contained ABC chord token.
+
+    Every note carries an explicit accidental (`^`, `_` or `=`), so the token
+    means the same thing under any K: header and regardless of accidentals
+    earlier in the bar — the two things that make hand-spelled ABC chords go
+    wrong. Returns {'abc_token', 'note_names', 'notes', 'quality'}.
+    """
+    quality = normalize_chord_quality(quality, root=root)
+    midis = build_chord(root, quality, octave)
+    names = chord_note_names(root, quality, octave)
+    tokens = []
+    for midi, name in zip(midis, names):
+        token = _midi_to_abc_token(midi, name)
+        if not token[0] in "^_=":
+            token = "=" + token
+        tokens.append(token)
+    return {
+        "abc_token": "[" + "".join(tokens) + "]",
+        "note_names": names,
+        "notes": midis,
+        "quality": quality,
+    }
+
+
 def key_prefers_flats(key: str | None) -> bool | None:
     """Does `key` use a flat signature?  None when the key gives no opinion.
 
